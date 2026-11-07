@@ -168,6 +168,37 @@ describe('CodeBuddy fixture sessions', () => {
     expect(end?.type === 'turn/end' ? end.data.reason.kind : '').toBe('completed')
   })
 
+  it('ends the turn on result while the CLI process stays up, then stops that process', async () => {
+    const { agent, dir } = await bootCodeBuddy('persist')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
+    expect(alive(pid)).toBe(false)
+    expect(turnEnds(agent)).toEqual(['completed'])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(turnEnds(agent)).toEqual(['completed', 'completed'])
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(argv[1]).toContain('--resume')
+    expect(argv[1]).toContain('cli-sess-1')
+  })
+
+  it('ends an approved resident turn on result instead of waiting for process exit', async () => {
+    const { agent } = await bootCodeBuddy('persist-approval')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'echo hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(texts(agent)).toContain('allowed')
+    expect(turnEnds(agent)).toEqual(['completed'])
+  })
+
+  it('records a resident error result without treating the later stop as the outcome', async () => {
+    const { agent } = await bootCodeBuddy('persist-error')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
+    expect(end?.type === 'turn/end' ? end.data.reason : {}).toMatchObject({ kind: 'error', error: { code: 'CLI_RESULT' } })
+  })
+
   it('kills the fixture and its child when approval is cancelled', async () => {
     const { agent, dir } = await bootCodeBuddy('hang', 'hold')
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'sleep' }], source: { kind: 'user' } }))
@@ -242,6 +273,10 @@ describe('DeepSeek sessions and profile shape', () => {
     ])
   })
 })
+
+function turnEnds(agent: Agent): string[] {
+  return agent.session.snapshotEvents().flatMap(event => event.type === 'turn/end' ? [event.data.reason.kind] : [])
+}
 
 function alive(pid: number): boolean {
   try {

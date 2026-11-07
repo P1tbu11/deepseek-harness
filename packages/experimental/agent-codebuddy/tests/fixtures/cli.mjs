@@ -111,6 +111,38 @@ if (scenario === 'chat') {
   })
   send({ type: 'result', subtype: 'success', session_id: sessionId(), result: allowed ? 'allowed' : 'denied', is_error: false })
   process.exit(0)
+} else if (scenario === 'persist' || scenario === 'persist-error' || scenario === 'persist-approval') {
+  if (process.env.CODEBUDDY_CHILD_PID_FILE) writeFileSync(process.env.CODEBUDDY_CHILD_PID_FILE, String(process.pid))
+  if (scenario === 'persist-approval') {
+    send({
+      type: 'control_request',
+      request_id: 'perm-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: prompt }, tool_use_id: 'toolu_perm' },
+    })
+    const reply = await nextLine()
+    const decision = reply?.response?.response
+    const allowed = decision?.allowed === true && decision?.behavior === undefined && decision?.tool_use_id === 'toolu_perm'
+    send({
+      type: 'assistant',
+      session_id: sessionId(),
+      message: { content: [{ type: 'text', text: allowed ? 'allowed' : 'denied' }] },
+    })
+  } else {
+    send({
+      type: 'assistant',
+      session_id: sessionId(),
+      message: { content: [{ type: 'text', text: 'persisted' }] },
+    })
+  }
+  const failed = scenario === 'persist-error'
+  send({
+    type: 'result',
+    subtype: failed ? 'error' : 'success',
+    session_id: sessionId(),
+    result: failed ? 'persisted-error' : 'persisted',
+    is_error: failed,
+  })
+  await new Promise(() => {})
 } else if (scenario === 'hang') {
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
   if (process.env.CODEBUDDY_CHILD_PID_FILE) writeFileSync(process.env.CODEBUDDY_CHILD_PID_FILE, String(child.pid))

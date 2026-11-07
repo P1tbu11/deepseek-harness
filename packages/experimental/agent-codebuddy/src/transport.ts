@@ -11,6 +11,8 @@ export interface CliQuery {
   /** Write one more NDJSON line. Used for permission and bridge replies. */
   send(value: unknown): void
   cancel(): Promise<void>
+  /** Stop the process after a turn result. Does not send `interrupt`. */
+  stop(): Promise<void>
   finished(): Promise<{ readonly exitCode: number | null; readonly stderr: string }>
 }
 
@@ -73,6 +75,10 @@ export async function startQuery(ctx: Context, input: {
         request: { subtype: 'interrupt', reason: 'User interrupt' },
       })
       await new Promise(resolve => setTimeout(resolve, 50))
+      handle.terminate()
+      await handle.waitForExit().catch(() => false)
+    },
+    stop: async () => {
       handle.terminate()
       await handle.waitForExit().catch(() => false)
     },

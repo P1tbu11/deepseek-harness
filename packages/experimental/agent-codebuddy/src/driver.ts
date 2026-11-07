@@ -78,6 +78,7 @@ export async function runCliTurn(input: {
   const committed: string[] = []
   let usage: TokenUsage | undefined
   let fault: ProtocolFault | undefined
+  let sawResult = false
   let resultError = false
   let step = 1
   const attempt = LlmAttemptId(`codebuddy-${input.turn}`)
@@ -151,6 +152,7 @@ export async function runCliTurn(input: {
             }),
           }, { surfaceOp: 'append', sourceEventSeqs: [call] })
         } else if (event.kind === 'result') {
+          sawResult = true
           resultError = event.isError
         } else if (event.kind === 'diagnostic') {
           input.ctx.logger.warn(`codebuddy ${event.code}: ${event.detail}`)
@@ -161,24 +163,31 @@ export async function runCliTurn(input: {
   } finally {
     input.signal.removeEventListener('abort', abortQuery)
     finishLive(undefined)
-    if (input.signal.aborted) await query.cancel()
-    const done = await query.finished()
     if (input.signal.aborted) {
+      await query.cancel()
       session.append('turn/end', { turn: input.turn, reason: { kind: 'aborted', reason: { kind: 'user' } } })
-    } else if (fault !== undefined || done.exitCode !== 0 && done.exitCode !== null) {
-      const detail = fault?.detail ?? `cli exited ${done.exitCode}`
-      const stderr = done.stderr === '' ? '' : `; stderr: ${done.stderr}`
-      session.append('turn/end', {
-        turn: input.turn,
-        reason: { kind: 'error', error: { message: `${fault?.code ?? 'CLI_EXIT'}: ${detail}${stderr}`, code: fault?.code ?? 'CLI_EXIT' } },
-      })
-    } else if (resultError) {
-      session.append('turn/end', {
-        turn: input.turn,
-        reason: { kind: 'error', error: { message: 'cli result reported an error', code: 'CLI_RESULT' } },
-      })
+    } else if (sawResult) {
+      if (resultError) {
+        session.append('turn/end', {
+          turn: input.turn,
+          reason: { kind: 'error', error: { message: 'cli result reported an error', code: 'CLI_RESULT' } },
+        })
+      } else {
+        session.append('turn/end', { turn: input.turn, reason: { kind: 'completed' } })
+      }
+      await query.stop()
     } else {
-      session.append('turn/end', { turn: input.turn, reason: { kind: 'completed' } })
+      const done = await query.finished()
+      if (fault !== undefined || done.exitCode !== 0 && done.exitCode !== null) {
+        const detail = fault?.detail ?? `cli exited ${done.exitCode}`
+        const stderr = done.stderr === '' ? '' : `; stderr: ${done.stderr}`
+        session.append('turn/end', {
+          turn: input.turn,
+          reason: { kind: 'error', error: { message: `${fault?.code ?? 'CLI_EXIT'}: ${detail}${stderr}`, code: fault?.code ?? 'CLI_EXIT' } },
+        })
+      } else {
+        session.append('turn/end', { turn: input.turn, reason: { kind: 'completed' } })
+      }
     }
     await input.dispatch.serial('agent/turn-stopping', { turn: input.turn, signal: input.signal })
   }

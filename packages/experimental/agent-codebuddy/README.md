@@ -65,7 +65,7 @@ The fixture in `tests/fixtures/cli.mjs` is synthetic. It is not an enterprise CL
 | stderr | exit diagnostic, with bearer tokens, `sk-` keys, and `api_key` values redacted |
 | terminal cell layout | not represented |
 
-Default mode sends only the user's text. It does not pass `--system-prompt`, `--append-system-prompt`, `--tools`, or `--dangerously-skip-permissions`. `--setting-sources` is omitted so the CLI keeps its own login and settings. `--permission-mode` is `default`. `can_use_tool` calls `ctx.approval.request` and fails closed when approval is absent. There is no default allow.
+Default mode sends only the user's text. It does not pass `--system-prompt`, `--append-system-prompt`, `--tools`, or `--dangerously-skip-permissions`. `--setting-sources` is omitted so the CLI keeps its own login and settings. `--permission-mode` is `default`. `can_use_tool` calls `ctx.approval.request` and fails closed when approval is absent. There is no default allow. A `result` event ends that turn; the driver then stops the process. It does not wait for a resident CLI to exit by itself, and assistant text does not end the turn.
 
 The CLI working directory is the session directory the host passed in. On the Web profile that is the selected workspace path, so the session can attach to that workspace. The server process directory is used only when the host omitted a directory.
 
