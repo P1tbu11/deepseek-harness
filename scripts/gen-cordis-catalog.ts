@@ -69,6 +69,7 @@ export const SERVICE_PAGE: Record<string, string> = {
   hmr: 'boot.md',
   mcpResources: 'mcp.md',
   agentLoop: 'core.md',
+  codebuddySettings: 'codebuddy.md',
   mcpManager: 'mcp.md',
   agentDefaultModel: 'core.md',
   agentPresets: 'core.md',

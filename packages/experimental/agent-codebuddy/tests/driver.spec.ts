@@ -55,8 +55,12 @@ async function harness(
   await ctx.plugin(LocalSubprocess)
   await ctx.plugin(ApprovalService)
   ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write' }) })
+  const calls = { pluginLists: 0 }
   ctx.provide('pluginManager', {
-    listPlugins: async () => [{ id: 'tool-plugin-manager', name: '@deepseek-ai/dsh-plugin-manager/tools' }],
+    listPlugins: async () => {
+      calls.pluginLists += 1
+      return [{ id: 'tool-plugin-manager', name: '@deepseek-ai/dsh-plugin-manager/tools' }]
+    },
     listBundles: async () => [],
   })
   applyPluginTools(ctx)
@@ -65,7 +69,7 @@ async function harness(
   ctx.llm.registerAdapter(['mock'], adapter)
   await ctx.plugin(CodeBuddySettings, { stateDir: dir, ...config })
   await ctx.plugin(CodeBuddyLoop, { agents: [] })
-  return { ctx, dir, adapter, async stop() { await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }) } }
+  return { ctx, dir, adapter, calls, async stop() { await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }) } }
 }
 
 const dirs: { stop(): Promise<void> }[] = []
@@ -113,7 +117,7 @@ function texts(agent: Agent): string[] {
 
 describe('CodeBuddy fixture sessions', () => {
   it('replays two turns through one CLI session id and does not duplicate streamed text', async () => {
-    const { agent, dir } = await bootCodeBuddy('chat')
+    const { agent, dir, adapter, calls: pluginCalls } = await bootCodeBuddy('chat')
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
@@ -127,6 +131,9 @@ describe('CodeBuddy fixture sessions', () => {
     expect(argv[1]).toContain('--resume')
     expect(argv[1]).toContain('cli-sess-1')
     expect(argv[0]?.includes('--system-prompt')).toBe(false)
+    expect(argv[0]?.includes('--tools')).toBe(false)
+    expect(pluginCalls.pluginLists).toBe(0)
+    expect(adapter.requests).toHaveLength(0)
   })
 
   it('resumes the same CLI session from a new factory instance', async () => {
@@ -178,7 +185,7 @@ describe('CodeBuddy fixture sessions', () => {
   })
 
   it('lets a creator-mode CodeBuddy session discover and call plugin_manager once', async () => {
-    const { agent } = await bootCodeBuddy('creator')
+    const { agent, adapter, calls: pluginCalls } = await bootCodeBuddy('creator')
     agent.session.append('agent-preset/selected', { agentPreset: 'cordis' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'list plugins' }], source: { kind: 'user' } }))
     await agent.whenIdle()
@@ -186,7 +193,11 @@ describe('CodeBuddy fixture sessions', () => {
     expect(text).toContain('tool-plugin-manager')
     expect(text).not.toContain('secret')
     const calls = agent.session.snapshotEvents().filter(event => event.type === 'tool/call')
+    const results = agent.session.snapshotEvents().filter(event => event.type === 'tool/result')
     expect(calls.map(event => event.type === 'tool/call' ? event.data.name : '')).toEqual(['plugin_manager'])
+    expect(results).toHaveLength(1)
+    expect(pluginCalls.pluginLists).toBe(1)
+    expect(adapter.requests).toHaveLength(0)
   })
 
   it('does not treat an unknown event as success or store its payload', async () => {

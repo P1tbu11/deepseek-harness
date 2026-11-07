@@ -14,6 +14,7 @@ export type Projected =
   | { readonly kind: 'result'; readonly text: string; readonly isError: boolean }
   | { readonly kind: 'diagnostic'; readonly code: string; readonly detail: string }
 
+/** One text or reasoning block copied from an assistant message. */
 export type AssistantOut =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'reasoning'; readonly text: string }

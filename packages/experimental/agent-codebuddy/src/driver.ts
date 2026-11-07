@@ -20,7 +20,11 @@ import {
 } from './protocol.ts'
 import { startQuery, type CliQuery } from './transport.ts'
 
-/** Text sent to the CLI, or a refusal before any process starts. */
+/**
+ * Text sent to the CLI. Non-text blocks refuse the turn before any process starts.
+ * @param message - the user message taken from the inbox.
+ * @returns the joined text blocks.
+ */
 export function promptText(message: UserMessage): string {
   const blocks: readonly ContentBlock[] = message.content
   const foreign = blocks.filter(block => block.type !== 'text').map(block => block.type)
@@ -32,7 +36,8 @@ export function promptText(message: UserMessage): string {
 
 /**
  * Run one CLI turn and append the projected events.
- * @returns the CLI session id when the CLI reported one.
+ * @param input - the host, session, prompt, and CLI launch for this turn.
+ * @returns nothing. The CLI session id is stored through `input.onSession`.
  */
 export async function runCliTurn(input: {
   readonly ctx: Context
@@ -49,6 +54,7 @@ export async function runCliTurn(input: {
   readonly graceMs: number
   readonly signal: AbortSignal
   readonly onSession: (id: string) => Promise<void> | void
+  readonly dispatch: AgentEventDispatch
 }): Promise<void> {
   const session = input.session
   session.append('turn/start', { turn: input.turn })
@@ -174,7 +180,7 @@ export async function runCliTurn(input: {
     } else {
       session.append('turn/end', { turn: input.turn, reason: { kind: 'completed' } })
     }
-    await input.ctx.emit('agent/turn-stopping', { agent: input.agent, turn: input.turn, signal: input.signal })
+    await input.dispatch.serial('agent/turn-stopping', { turn: input.turn, signal: input.signal })
   }
 }
 
@@ -383,6 +389,7 @@ export class CodeBuddyAgent implements Agent {
   private idle = Promise.resolve()
   private active: AbortController | undefined
   private readonly dispatch: AgentEventDispatch
+  /** CLI session id remembered for the next `--resume`, when one exists. */
   binding: CliBinding | undefined
 
   constructor(
@@ -415,6 +422,11 @@ export class CodeBuddyAgent implements Agent {
 
   get status(): 'idle' | 'running' { return this.phase }
 
+  /**
+   * Preset selected for this session.
+   * Later `agent-preset/selected` events replace the value from creation.
+   * @returns the preset name, or `undefined` when the session has none.
+   */
   currentPreset(): string | undefined {
     const events = this.session.snapshotEvents()
     let preset = this.presetHint
@@ -506,6 +518,7 @@ export class CodeBuddyAgent implements Agent {
           ...this.binding?.cliSessionId !== undefined ? { resume: this.binding.cliSessionId } : {},
           graceMs: this.launch.graceMs,
           signal: controller.signal,
+          dispatch: this.dispatch,
           onSession: async (id) => {
             this.binding = { cliSessionId: id, creator }
             await this.launch.remember(this.session.id, this.binding)

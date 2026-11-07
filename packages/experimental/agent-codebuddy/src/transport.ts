@@ -97,7 +97,11 @@ async function* readMessages(handle: SubprocessHandle): AsyncIterable<ProtocolMe
   }
 }
 
-/** Drop obvious credential material from a diagnostic tail. */
+/**
+ * Drop obvious credential material from a diagnostic tail.
+ * @param text - stderr or protocol detail that may contain a token.
+ * @returns the same text with bearer tokens, `sk-` keys, and secret assignments replaced.
+ */
 export function redact(text: string): string {
   return text
     .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')

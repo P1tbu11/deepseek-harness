@@ -1,6 +1,6 @@
 ---
-description: "Experimental factory plugin that drives codebuddy-provider sessions with a local CodeBuddy CLI and leaves every other provider on the default agent loop."
-kind: "package-reference"
+description: "Experimental profile layer that drives codebuddy-provider sessions with a local CodeBuddy CLI and leaves every other provider on the default agent loop."
+kind: "package-bundle"
 ---
 
 # @deepseek-ai/dsh-agent-codebuddy
@@ -9,16 +9,17 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Select this bundle on a profile that already stacks `dsh-base`. The bundle disables the stock `agent-loop` row and inserts one factory. Sessions whose provider is `codebuddy` are driven by an installed CodeBuddy CLI. Every other provider, including DeepSeek and the cordis creator preset, still uses `AgentLoop`.
-
-The plugin does not depend on `@tencent-ai/agent-sdk`. That package ships a CLI binary. This plugin speaks the SDK's documented stream-json control subset and spawns only the executable you configure.
+Select this layer on a profile that already stacks `dsh-base`. It disables the stock `agent-loop` row and inserts one factory. Sessions whose provider is `codebuddy` are driven by an installed CodeBuddy CLI. Every other provider still uses `AgentLoop`. Creator mode stays on this driver and adds a `plugin_manager` bridge.
 
 ## Table of Contents
 
 - [Use this package](#use-this-package)
 - [Output fidelity](#output-fidelity)
-- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Understand the implementation](#understand-the-implementation)
+- [Further Exploration](#further-exploration)
 - [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
 
 -----
 
@@ -65,16 +66,28 @@ The fixture in `tests/fixtures/cli.mjs` is synthetic. It is not an enterprise CL
 
 Default mode sends only the user's text. It does not pass `--system-prompt`, `--append-system-prompt`, `--tools`, or `--dangerously-skip-permissions`. `--setting-sources` is omitted so the CLI keeps its own login and settings. `--permission-mode` is `default`. `can_use_tool` calls `ctx.approval.request` and fails closed when approval is absent. There is no default allow.
 
-Creator mode (`agentPreset: cordis`) adds an in-process bridge named `dsh` for the registered `plugin_manager` tool only. The tool body runs once, then the result is recorded. That is not native CLI behavior. Other DSH tools stay on DeepSeek sessions and are not copied into the CLI prompt.
+Creator mode (`agentPreset: cordis`) adds an in-process bridge named `dsh` for the registered `plugin_manager` tool only. The fixture calls that tool once through the bridge, and the host records that one result. The host does not run the tool again from the logged `tool/call`. That bridge is not native CLI behavior. Other DSH tools stay on DeepSeek sessions and are not copied into the CLI prompt.
 
-<a id="known-limitations-and-deferred-work"></a>
-## Known Limitations and Deferred Work
+-----
 
-- The engine is chosen when the session is created or resumed. Changing the model picker afterward does not move a live session between drivers.
-- User messages that contain non-text blocks are refused before the CLI starts.
-- File bodies are not reconstructed from `file-history-snapshot`. A diff appears only when the tool result text or a normal workspace-changes turn snapshot already has it.
-- `query()` is one CLI process per DSH turn. The next turn passes `--resume`. Interrupt acknowledgement is not treated as exit.
-- Visual Web acceptance was not run in the cloud environment. Tool rows use the existing `tool/call` cards.
+<a id="understand-the-implementation"></a>
+## Understand the implementation
+
+<details>
+<summary>Implementation internals — click to expand</summary>
+
+[`cordis.patch.yml`](cordis.patch.yml) disables `agent-loop` and inserts `agent-codebuddy-settings` plus `agent-codebuddy`. The settings service owns `command`, `args`, `probe`, `probeTimeoutMs`, `model`, `stateDir`, and `graceMs`. The factory subclasses `AgentLoop` and calls `setFactory` once. A `codebuddy` provider launches the configured executable with stream-json input and output. The process group is terminated on cancel.
+
+</details>
+
+-----
+
+<a id="further-exploration"></a>
+## Further Exploration
+
+[Experimental packages](../README.md) and the [agent loop](../../core/agent-loop/README.md).
+
+-----
 
 <a id="model-experience"></a>
 ## Model Experience
@@ -106,3 +119,24 @@ None on the DeepSeek route.
 #### KV Cache effect
 
 The DeepSeek route is unchanged.
+
+## Known Limitations and Deferred Work
+
+<a id="known-limitations-and-deferred-work"></a>
+
+- The engine is chosen when the session is created or resumed. Changing the model picker afterward does not move a live session between drivers.
+- User messages that contain non-text blocks are refused before the CLI starts.
+- File bodies are not reconstructed from `file-history-snapshot`. A diff appears only when the tool result text or a normal workspace-changes turn snapshot already has it.
+- `query()` is one CLI process per DSH turn. The next turn passes `--resume`. Interrupt acknowledgement is not treated as exit.
+- Visual Web acceptance was not run. Tool rows use the existing `tool/call` cards.
+- A passing fixture test checks the stream-json projection and the creator-mode bridge. It does not show that a real CodeBuddy model or terminal TUI matches this projection byte for byte.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Working context for maintainers — click to expand</summary>
+
+The plugin does not depend on `@tencent-ai/agent-sdk`, because that package ships a CLI binary. It speaks the documented stream-json control subset and spawns only the configured executable.
+
+</details>

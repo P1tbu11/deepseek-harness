@@ -48,6 +48,25 @@ export type Config = z.infer<typeof Config>
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-action-cards -->
 
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-agent-codebuddy -->
+<a id="deepseek-aidsh-agent-codebuddy"></a>
+
+## `@deepseek-ai/dsh-agent-codebuddy`
+
+- `inject`: `...AgentLoop.inject` · `subprocess` · `codebuddySettings`
+- `refs`: [`LoopConfig`](#deepseek-aidsh-agent-loop)
+- `source`: [`packages/experimental/agent-codebuddy/src/index.ts:16`](../packages/experimental/agent-codebuddy/src/index.ts)
+
+```ts config-catalog
+/**
+ * Startup configuration for the replacement factory.
+ * CLI path and probe settings live on `codebuddySettings`, not on this type.
+ * The fields match the stock agent-loop schema so a profile can still declare startup agents.
+ */
+export interface CodeBuddyFactoryConfig extends LoopConfig {}
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-agent-codebuddy -->
+
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-agent-default-model -->
 <a id="deepseek-aidsh-agent-default-model"></a>
 

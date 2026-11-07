@@ -9,6 +9,13 @@ import { resolveCliPath } from './probe.ts'
 import type CodeBuddySettingsService from './settings.ts'
 
 /**
+ * Startup configuration for the replacement factory.
+ * CLI path and probe settings live on `codebuddySettings`, not on this type.
+ * The fields match the stock agent-loop schema so a profile can still declare startup agents.
+ */
+export interface CodeBuddyFactoryConfig extends LoopConfig {}
+
+/**
  * Agent factory that keeps the default loop for every provider except `codebuddy`.
  * The profile disables the stock `agent-loop` row and inserts this service, so
  * `setFactory` runs once.
@@ -20,7 +27,7 @@ export default class CodeBuddyLoop extends AgentLoop {
   private readonly locals: { ctx: Context }
   private bindings = new Map<string, CliBinding>()
 
-  constructor(ctx: Context, config: LoopConfig) {
+  constructor(ctx: Context, config: CodeBuddyFactoryConfig) {
     super(ctx, config)
     this.locals = { ctx }
   }

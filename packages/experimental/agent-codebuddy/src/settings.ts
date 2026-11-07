@@ -39,6 +39,10 @@ export default class CodeBuddySettingsService extends Service {
     graceMs: z.number().min(1).default(3000),
   })
 
+  /**
+   * @param ctx - host context that publishes the service.
+   * @param config - validated CLI settings.
+   */
   constructor(ctx: Context, public readonly config: CodeBuddySettings) {
     super(ctx, 'codebuddySettings')
   }
@@ -46,6 +50,7 @@ export default class CodeBuddySettingsService extends Service {
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
+    /** Deployment settings for the CodeBuddy CLI. */
     codebuddySettings: CodeBuddySettingsService
   }
 }

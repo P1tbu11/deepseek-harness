@@ -10,7 +10,9 @@ export interface McpCall {
   readonly params?: unknown
 }
 
+/** JSON-RPC result returned to the CLI, plus whether the DSH tool body ran. */
 export interface BridgeResult {
+  /** JSON-RPC result or error object sent back to the CLI. */
   readonly body: Record<string, unknown>
   /** True when the DSH tool body ran. */
   readonly executed: boolean

@@ -642,6 +642,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'codebuddySettings',
+    summary: 'Config service read by the CodeBuddy factory.',
+    description: 'Config service read by the CodeBuddy factory. Kept separate so the factory can keep the default agent-loop config schema.',
+    methods: [],
+  },
+  {
     key: 'commands',
     summary: 'Human-command registry.',
     description: 'Human-command registry. Plain-context definitions are global; definitions registered through a command-injected child of an agent context shadow globals for that agent.',
