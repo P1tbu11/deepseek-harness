@@ -67,6 +67,8 @@ pnpm exec vitest run packages/experimental/agent-codebuddy/tests
 
 默认模式只发送用户文本。不传 `--system-prompt`、`--append-system-prompt`、`--tools` 或 `--dangerously-skip-permissions`。不传 `--setting-sources`，以便 CLI 继续用自己的登录和设置。`--permission-mode` 为 `default`。`can_use_tool` 调用 `ctx.approval.request`，没有审批服务时拒绝。没有默认放行。
 
+CLI 的工作目录是宿主传入的会话目录。在 Web 配置里这就是所选工作区路径，会话因此能挂到该工作区。只有宿主没有传入目录时，才使用服务器进程的当前目录。
+
 创造模式（`agentPreset: cordis`）额外挂一个名为 `dsh` 的进程内桥，只暴露已注册的 `plugin_manager`。fixture 经该桥调用这个工具一次，宿主记下这一次结果。宿主不会因为日志里的 `tool/call` 再执行一次。这条桥不是 CLI 的原生行为。其他 DSH 工具仍留在 DeepSeek 会话中，不会抄进 CLI 提示词。
 
 -----

@@ -67,6 +67,8 @@ The fixture in `tests/fixtures/cli.mjs` is synthetic. It is not an enterprise CL
 
 Default mode sends only the user's text. It does not pass `--system-prompt`, `--append-system-prompt`, `--tools`, or `--dangerously-skip-permissions`. `--setting-sources` is omitted so the CLI keeps its own login and settings. `--permission-mode` is `default`. `can_use_tool` calls `ctx.approval.request` and fails closed when approval is absent. There is no default allow.
 
+The CLI working directory is the session directory the host passed in. On the Web profile that is the selected workspace path, so the session can attach to that workspace. The server process directory is used only when the host omitted a directory.
+
 Creator mode (`agentPreset: cordis`) adds an in-process bridge named `dsh` for the registered `plugin_manager` tool only. The fixture calls that tool once through the bridge, and the host records that one result. The host does not run the tool again from the logged `tool/call`. That bridge is not native CLI behavior. Other DSH tools stay on DeepSeek sessions and are not copied into the CLI prompt.
 
 -----

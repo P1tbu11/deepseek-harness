@@ -40,7 +40,7 @@ export default class CodeBuddyLoop extends AgentLoop {
 
   override async createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle> {
     if (providerOf(options.agentOptions) !== CODEBUDDY_PROVIDER) return super.createAgent(ownerCtx, options)
-    return this.openCodeBuddy(options.sessionId, options.agentOptions ?? {}, options.meta?.agentPreset, false)
+    return this.openCodeBuddy(options.sessionId, options.agentOptions ?? {}, options.meta, false)
   }
 
   override async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
@@ -54,7 +54,7 @@ export default class CodeBuddyLoop extends AgentLoop {
   private async openCodeBuddy(
     sessionId: SessionId,
     agentOptions: AgentOptions,
-    preset: string | undefined,
+    meta: CreateAgentOptions['meta'] | undefined,
     resume: boolean,
   ): Promise<AgentHandle> {
     if (!this.settings.enabled) throw new Error('codebuddy driver is disabled; set enabled: true on the plugin')
@@ -67,7 +67,8 @@ export default class CodeBuddyLoop extends AgentLoop {
     const host = this.locals.ctx
     const remembered = this.bindings.get(sessionId)
     const existing = resume ? host.sessions.get(sessionId) : undefined
-    const session = existing ?? host.sessions.prepare(sessionId, { meta: { cwd: process.cwd() } })
+    const cwd = meta?.cwd ?? existing?.header.cwd ?? process.cwd()
+    const session = existing ?? host.sessions.prepare(sessionId, { meta: { cwd } })
     if (existing === undefined) {
       host.sessions.enter(session)
       host.sessions.announce(session)
@@ -76,7 +77,7 @@ export default class CodeBuddyLoop extends AgentLoop {
       ...agentOptions,
       provider: CODEBUDDY_PROVIDER,
       model: this.settings.model || agentOptions.model || CLI_DEFAULT_MODEL,
-    }, preset ?? (remembered?.creator ? CREATOR_PRESET : undefined), remembered, {
+    }, meta?.agentPreset ?? (remembered?.creator ? CREATOR_PRESET : undefined), remembered, {
       command,
       args: this.settings.args,
       model: this.settings.model,
