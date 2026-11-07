@@ -12,6 +12,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { approvalAuditReason, approvalDisplayReason, permissionDetail } from './approval-copy.ts'
 import type { CliBinding } from './bindings.ts'
 import { handleBridgeCall, type McpCall } from './bridge.ts'
 import { BRIDGE_TOOL, CLI_DEFAULT_MODEL, CODEBUDDY_PROVIDER, CREATOR_PRESET } from './constants.ts'
@@ -249,7 +250,10 @@ async function answerControl(input: {
   const subtype = typeof body.subtype === 'string' ? body.subtype : ''
   if (subtype === 'can_use_tool') {
     const toolName = typeof body.tool_name === 'string' ? body.tool_name : 'tool'
-    const outcome = await ask(input.ctx, input.agent, toolName, input.signal)
+    // No `callId`: the CLI sends this request before its `tool_use`, so the
+    // Chat detail slot would find no correlated call when the card renders and
+    // would show the command a second time once the call is logged.
+    const outcome = await ask(input.ctx, input.agent, toolName, permissionDetail(body.input), input.signal)
     query.send({
       type: 'control_response',
       response: {
@@ -308,13 +312,21 @@ async function answerControl(input: {
   })
 }
 
-async function ask(ctx: Context, agent: Agent, toolName: string, signal: AbortSignal): Promise<string> {
+async function ask(
+  ctx: Context,
+  agent: Agent,
+  toolName: string,
+  detail: string | undefined,
+  signal: AbortSignal,
+): Promise<string> {
   const approval = ctx.get('approval')
   if (approval === undefined) return 'unavailable'
+  const displayReason = approvalDisplayReason(toolName, detail)
   const outcome = await approval.request({
     agent,
     toolName,
-    reason: `CodeBuddy CLI asks to use ${toolName}`,
+    reason: approvalAuditReason(toolName),
+    displayReason,
     signal,
   })
   return outcome

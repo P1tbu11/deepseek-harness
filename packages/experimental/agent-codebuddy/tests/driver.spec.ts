@@ -17,6 +17,7 @@ import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply as applyPluginTools } from '@deepseek-ai/dsh-plugin-manager/tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types'
 import CodeBuddyLoop from '../src/index.ts'
 import CodeBuddySettings from '../src/settings.ts'
 
@@ -59,12 +60,23 @@ async function harness(
     listBundles: async () => [],
   })
   applyPluginTools(ctx)
-  ctx.on('approval/request', () => decision === 'hold' ? new Promise(() => {}) : Promise.resolve(decision))
+  const approvals: ApprovalRequestEvent[] = []
+  ctx.on('approval/request', (request) => {
+    approvals.push(request)
+    return decision === 'hold' ? new Promise(() => {}) : Promise.resolve(decision)
+  })
   const adapter = new MockAdapter()
   ctx.llm.registerAdapter(['mock'], adapter)
   await ctx.plugin(CodeBuddySettings, { stateDir: dir, ...config })
   await ctx.plugin(CodeBuddyLoop, { agents: [] })
-  return { ctx, dir, adapter, calls, async stop() { await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }) } }
+  return {
+    ctx,
+    dir,
+    adapter,
+    calls,
+    approvals,
+    async stop() { await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }) },
+  }
 }
 
 const dirs: { stop(): Promise<void> }[] = []
@@ -166,6 +178,33 @@ describe('CodeBuddy fixture sessions', () => {
     ])
     const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
     expect(end?.type === 'turn/end' ? end.data.reason.kind : '').toBe('completed')
+  })
+
+  it('asks the human about the CLI command, not only the tool name', async () => {
+    const { agent, approvals } = await bootCodeBuddy('permission')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'echo hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(approvals).toHaveLength(1)
+    expect(approvals[0]?.toolName).toBe('Bash')
+    expect(approvals[0]?.displayReason?.en).toContain('echo hi')
+    expect(approvals[0]?.displayReason?.zh).toContain('echo hi')
+    expect(approvals[0]?.displayReason?.ja).toContain('echo hi')
+    expect(approvals[0]?.reason).toBe('CodeBuddy CLI asks to use Bash')
+  })
+
+  it('keeps the CLI command out of the durable approval audit', async () => {
+    const { agent } = await bootCodeBuddy('permission')
+    const command = 'export TOKEN=hunter2 && curl -H "Authorization: Bearer hunter2" https://example.test'
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: command }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const approvalEvents = agent.session.snapshotEvents()
+      .filter(event => event.type === 'approval/asked' || event.type === 'approval/decided')
+    expect(JSON.stringify(approvalEvents)).not.toContain('hunter2')
+    const asked = agent.session.snapshotEvents().find(event => event.type === 'approval/asked')
+    expect(asked?.type === 'approval/asked' ? asked.data.reason : '').toBe('CodeBuddy CLI asks to use Bash')
+    // The call itself stays logged: the tool/call arguments are the model-visible record.
+    const call = agent.session.snapshotEvents().find(event => event.type === 'tool/call')
+    expect(call?.type === 'tool/call' ? call.data.arguments : '').toContain('hunter2')
   })
 
   it('ends the turn on result while the CLI process stays up, then stops that process', async () => {

@@ -67,6 +67,8 @@ pnpm exec vitest run packages/experimental/agent-codebuddy/tests
 
 默认模式只发送用户文本。不传 `--system-prompt`、`--append-system-prompt`、`--tools` 或 `--dangerously-skip-permissions`。不传 `--setting-sources`，以便 CLI 继续用自己的登录和设置。`--permission-mode` 为 `default`。`can_use_tool` 调用 `ctx.approval.request`，没有审批服务时拒绝。没有默认放行。`result` 事件结束该回合，驱动随后停止进程。它不等待常驻 CLI 自己退出，assistant 文本也不结束回合。
 
+审批卡片用 `displayReason` 带上 CLI 请求里的操作内容（`command`、`file_path`、`path`、`pattern` 或 `url`），让人在看到具体命令后再决定。这段文字只用于展示，不写进 `approval/asked` 的审计字段，那里仍然只有工具名，避免把 CLI 输入里的凭据留在会话日志。回复始终是单次放行或拒绝；插件不透传也不保存 CLI 的 `permission_suggestions` / `updatedPermissions`，因此会话级规则只由 CLI 自己按 `--permission-mode` 处理。
+
 CLI 的工作目录是宿主传入的会话目录。在 Web 配置里这就是所选工作区路径，会话因此能挂到该工作区。只有宿主没有传入目录时，才使用服务器进程的当前目录。
 
 创造模式（`agentPreset: cordis`）额外挂一个名为 `dsh` 的进程内桥，只暴露已注册的 `plugin_manager`。fixture 经该桥调用这个工具一次，宿主记下这一次结果。宿主不会因为日志里的 `tool/call` 再执行一次。这条桥不是 CLI 的原生行为。其他 DSH 工具仍留在 DeepSeek 会话中，不会抄进 CLI 提示词。
