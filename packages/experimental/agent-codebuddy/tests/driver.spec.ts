@@ -342,6 +342,81 @@ describe('DeepSeek sessions and profile shape', () => {
     expect(models[0]).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text'] })
   })
 
+  it('resolves every advertised model so a picker selection can commit', async () => {
+    const { ctx } = await bootCodeBuddy('chat')
+    const models = await ctx.llm.listModels('codebuddy')
+    expect(models.length).toBeGreaterThan(1)
+    for (const model of models) {
+      // The session controller validates a click with exactly this pair before
+      // recording it, so a failure here is the "请选择模型" symptom.
+      await expect(ctx.llm.resolveCallConfig({ provider: 'codebuddy', model: model.id }))
+        .resolves.toMatchObject({ provider: 'codebuddy', model: model.id })
+      await expect(ctx.llm.resolveModelInfo('codebuddy', model.id))
+        .resolves.toMatchObject({ provider: 'codebuddy', id: model.id })
+    }
+  })
+
+  it('labels the synthetic default from the catalog rather than echoing the id', async () => {
+    const { ctx } = await bootCodeBuddy('chat')
+    const info = await ctx.llm.resolveModelInfo('codebuddy', 'default')
+    expect(info).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text'] })
+    expect(info.description).toContain('CodeBuddy CLI')
+  })
+
+  it('rejects a model id the catalog does not advertise', async () => {
+    const { ctx } = await bootCodeBuddy('chat')
+    await expect(ctx.llm.resolveModelInfo('codebuddy', 'not-a-real-model'))
+      .rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
+  })
+
+  it('appends the claimed inbox message so the client retires its own row', async () => {
+    const { agent } = await bootCodeBuddy('chat')
+    const sent = createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } })
+    agent.followup(sent)
+    await agent.whenIdle()
+    const appended = agent.session.snapshotEvents().filter(event => event.type === 'user/message')
+    // One row: the claimed message itself. Rebuilding it would mint a new id,
+    // and the Chat client hides inbox rows by the id it claimed, so a copy
+    // would render alongside the pending row until the turn closed.
+    expect(appended).toHaveLength(1)
+    // `user/message` carries the message itself as its data.
+    const row = appended[0]
+    expect(row?.type === 'user/message' ? row.data.id : undefined).toBe(sent.id)
+  })
+
+  it('brackets every step so the client can retire its transient rows', async () => {
+    const { agent } = await bootCodeBuddy('chat')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const events = agent.session.snapshotEvents()
+    for (const event of events) {
+      if (event.type !== 'assistant/message') continue
+      const { turn, step } = event.data
+      const started = events.findIndex(candidate =>
+        candidate.type === 'step/start' && candidate.data.turn === turn && candidate.data.step === step)
+      const ended = events.findIndex(candidate =>
+        candidate.type === 'step/end' && candidate.data.turn === turn && candidate.data.step === step)
+      // The chat client keeps an assistant message's transient stream rows until
+      // the Step owning it ends; without a close, both copies stay on screen.
+      expect(started).toBeGreaterThanOrEqual(0)
+      expect(ended).toBeGreaterThan(started)
+    }
+  })
+
+  it('closes the open step when a turn is stopped mid-stream', async () => {
+    const { agent } = await bootCodeBuddy('stubborn')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    agent.cancel({ kind: 'user' })
+    await agent.whenIdle()
+    const events = agent.session.snapshotEvents()
+    const opened = events.filter(event => event.type === 'step/start').length
+    const closed = events.filter(event => event.type === 'step/end').length
+    // Every opened step is closed even though the CLI never produced a result.
+    expect(opened).toBeGreaterThan(0)
+    expect(closed).toBe(opened)
+  })
+
   it('omits --model when the synthetic default is selected', async () => {
     const { agent, dir } = await bootCodeBuddy('chat')
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))

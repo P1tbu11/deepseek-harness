@@ -3,7 +3,7 @@ import { AgentModel, agentEvents, modelSelectionProjectionDefinition } from "@de
 import AgentLoop from "@deepseek-ai/dsh-agent-loop";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { LlmAdapter, LlmAttemptId, LlmError, ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { LlmAdapter, LlmAttemptId, LlmError, ToolCallId, createAssistantMessage, createToolResultMessage } from "@deepseek-ai/dsh-llm";
 import { createScope } from "@deepseek-ai/dsh-scope";
 import { SessionSeq } from "@deepseek-ai/dsh-session";
 import { createInterface } from "node:readline";
@@ -243,6 +243,38 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 		return {
 			id: provider,
 			name: "CodeBuddy"
+		};
+	}
+	/**
+	* Resolve one exact model id for the call pipeline.
+	*
+	* The base implementation echoes the id, which would label a picker entry
+	* `default` and leave the session-controller with nothing to validate against.
+	* Answering from the same catalog `listModels` advertises keeps selection and
+	* display consistent, and a request for an id the catalog does not offer fails
+	* here instead of inside the CLI.
+	* @param provider - the route this adapter registered.
+	* @param model - exact model id a user selected.
+	* @returns resolved identity plus the modalities the catalog declared.
+	*/
+	async resolveModel(provider, model) {
+		const catalog = await this.catalog();
+		if (model === "default") {
+			const configured = catalog.configured;
+			return {
+				provider,
+				id: model,
+				name: "Default",
+				description: configured === "" ? "Uses the model configured in the CodeBuddy CLI" : `Uses the CodeBuddy CLI's configured model: ${configured}`,
+				inputModalities: ["text"]
+			};
+		}
+		if (!catalog.models.includes(model)) throw new LlmError(`CodeBuddy does not advertise model "${model}"`, "UNKNOWN_MODEL");
+		return {
+			provider,
+			id: model,
+			name: model,
+			inputModalities: ["text"]
 		};
 	}
 	async listModels(provider) {
@@ -797,13 +829,7 @@ function promptText(message) {
 async function runCliTurn(input) {
 	const session = input.session;
 	session.append("turn/start", { turn: input.turn });
-	session.append("user/message", createUserMessage({
-		content: [{
-			type: "text",
-			text: input.prompt
-		}],
-		source: { kind: "user" }
-	}), { surfaceOp: "append" });
+	session.append("user/message", input.message, { surfaceOp: "append" });
 	const query = await startQuery(input.ctx, {
 		command: input.command,
 		args: input.args,
@@ -831,6 +857,38 @@ async function runCliTurn(input) {
 	let chunkIndex = 0;
 	const dispatch = agentEvents(input.ctx, input.agent);
 	let started = false;
+	/**
+	* Step boundary bookkeeping.
+	*
+	* The Chat client keeps an assistant message's transient stream rows until
+	* the Step that owns it ends, so it can retire them and reveal the durable
+	* message in their place. A driver that never records `step/end` leaves both
+	* visible at once, which reads as the same reply printed twice until the turn
+	* closes. The stock `agent-loop` brackets every step with `step/start` and
+	* `step/end`; this driver has to do the same.
+	*/
+	let openStep;
+	const stepStart = (value) => {
+		if (openStep === value) return;
+		if (openStep !== void 0) session.append("step/end", {
+			turn: input.turn,
+			step: openStep
+		});
+		session.append("step/start", {
+			turn: input.turn,
+			step: value
+		});
+		openStep = value;
+	};
+	const stepEnd = (value) => {
+		const closing = value ?? openStep;
+		if (closing === void 0) return;
+		session.append("step/end", {
+			turn: input.turn,
+			step: closing
+		});
+		if (openStep === closing) openStep = void 0;
+	};
 	const finishLive = (seq) => {
 		if (!started) return;
 		dispatch.emit("agent/assistant-stream", { frame: {
@@ -903,16 +961,21 @@ async function runCliTurn(input) {
 			else if (event.kind === "assistant") {
 				const text = event.blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
 				if (text !== "") committed.push(text);
+				stepStart(step);
 				finishLive(appendAssistant(session, input.turn, step, event.blocks, usage, input.recordModel));
+				stepEnd(step);
 				step += 1;
-			} else if (event.kind === "tool-call") session.append("tool/call", {
-				turn: input.turn,
-				step,
-				callId: ToolCallId(event.id),
-				name: event.name,
-				arguments: event.arguments
-			});
-			else if (event.kind === "tool-result") {
+			} else if (event.kind === "tool-call") {
+				stepStart(step);
+				session.append("tool/call", {
+					turn: input.turn,
+					step,
+					callId: ToolCallId(event.id),
+					name: event.name,
+					arguments: event.arguments
+				});
+			} else if (event.kind === "tool-result") {
+				stepStart(step);
 				const call = findCall(session, event.id) ?? previousSeq(session);
 				session.append("tool/result", {
 					turn: input.turn,
@@ -939,6 +1002,7 @@ async function runCliTurn(input) {
 		input.signal.removeEventListener("abort", stopReading);
 		input.signal.removeEventListener("abort", abortQuery);
 		finishLive(void 0);
+		stepEnd();
 		if (input.signal.aborted) {
 			query.terminate();
 			session.append("turn/end", {
@@ -1367,6 +1431,7 @@ var CodeBuddyAgent = class {
 					agent: this,
 					session: this.session,
 					turn: this.turn,
+					message,
 					prompt: text,
 					creator,
 					command: this.launch.command,

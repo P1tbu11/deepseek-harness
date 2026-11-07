@@ -46,4 +46,27 @@ if (workspace.length > 0) {
     `standalone/package.json still declares workspace: peers: ${workspace.map(([name]) => name).join(', ')}`,
   )
 }
+
+/**
+ * Every plugin row a profile composes must name THIS package.
+ *
+ * The loader resolves a bundle's patch entries by package name from the profile
+ * directory. A patch that names another package — the parent's `@deepseek-ai/`
+ * identity, or a previous name of this one — leaves the row unimported, so the
+ * factory never installs and a picker that still advertises the route cannot
+ * select a model from it. Checking here keeps the two patch files in step with
+ * the manifest after a rename.
+ */
+for (const file of ['cordis.patch.yml', 'profile.patch.yml']) {
+  const text = await readFile(join(here, file), 'utf8')
+  for (const match of text.matchAll(/name:\s*'([^']+)'/g)) {
+    const specifier = match[1]
+    if (specifier !== manifest.name && !specifier.startsWith(`${manifest.name}/`)) {
+      throw new Error(
+        `${file} names ${specifier}, but this package is ${manifest.name}; a profile cannot resolve the row`,
+      )
+    }
+  }
+}
 process.stdout.write('sync: manifest versions and peer ranges verified\n')
+process.stdout.write('sync: bundle patch rows name this package\n')

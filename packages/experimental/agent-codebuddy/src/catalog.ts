@@ -51,6 +51,47 @@ class CodeBuddyCatalog extends LlmAdapter {
     return { id: provider, name: 'CodeBuddy' }
   }
 
+  /**
+   * Resolve one exact model id for the call pipeline.
+   *
+   * The base implementation echoes the id, which would label a picker entry
+   * `default` and leave the session-controller with nothing to validate against.
+   * Answering from the same catalog `listModels` advertises keeps selection and
+   * display consistent, and a request for an id the catalog does not offer fails
+   * here instead of inside the CLI.
+   * @param provider - the route this adapter registered.
+   * @param model - exact model id a user selected.
+   * @returns resolved identity plus the modalities the catalog declared.
+   */
+  override async resolveModel(provider: string, model: string): Promise<{
+    provider: string
+    id: string
+    name: string
+    description?: string
+    inputModalities?: readonly ['text']
+  }> {
+    const catalog = await this.catalog()
+    if (model === DEFAULT_MODEL_ID) {
+      const configured = catalog.configured
+      return {
+        provider,
+        id: model,
+        name: 'Default',
+        description: configured === ''
+          ? 'Uses the model configured in the CodeBuddy CLI'
+          : `Uses the CodeBuddy CLI's configured model: ${configured}`,
+        inputModalities: ['text'],
+      }
+    }
+    if (!catalog.models.includes(model)) {
+      throw new LlmError(
+        `CodeBuddy does not advertise model "${model}"`,
+        'UNKNOWN_MODEL',
+      )
+    }
+    return { provider, id: model, name: model, inputModalities: ['text'] }
+  }
+
   override async listModels(provider: string): Promise<readonly {
     provider: string
     id: string

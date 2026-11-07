@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-agent-codebuddy",
+  "name": "@p1tbu11/dsh-agent-codebuddy",
   "description": "Drive a DSH session with a locally installed CodeBuddy CLI, keeping DeepSeek sessions on the default loop.",
   "version": "0.2.2-rc.1",
   "publishConfig": {
@@ -7,12 +7,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/deepseek-ai/deepseek-harness.git",
+    "url": "git+https://github.com/P1tbu11/deepseek-harness.git",
     "directory": "packages/experimental/agent-codebuddy/standalone"
   },
+  "homepage": "https://github.com/P1tbu11/deepseek-harness/tree/cursor/codebuddy-agent-plugin-f2a1/packages/experimental/agent-codebuddy/standalone#readme",
+  "bugs": {
+    "url": "https://github.com/P1tbu11/deepseek-harness/issues"
+  },
+  "author": "bangbang <P1tbu11@users.noreply.github.com>",
   "type": "module",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "default": "./dist/index.js"

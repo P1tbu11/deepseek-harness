@@ -8,7 +8,7 @@ import type {
   AgentCancelCause, Session, UserMessage,
 } from '@deepseek-ai/dsh-session'
 import {
-  createAssistantMessage, createToolResultMessage, createUserMessage, LlmAttemptId, ToolCallId,
+  createAssistantMessage, createToolResultMessage, LlmAttemptId, ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
@@ -44,6 +44,8 @@ export async function runCliTurn(input: {
   readonly agent: Agent
   readonly session: Session
   readonly turn: number
+  /** The claimed inbox message; appended as-is so the client can retire its row. */
+  readonly message: UserMessage
   readonly prompt: string
   readonly creator: boolean
   readonly command: string
@@ -60,10 +62,13 @@ export async function runCliTurn(input: {
 }): Promise<void> {
   const session = input.session
   session.append('turn/start', { turn: input.turn })
-  session.append('user/message', createUserMessage({
-    content: [{ type: 'text', text: input.prompt }],
-    source: { kind: 'user' },
-  }), { surfaceOp: 'append' })
+  // Append the claimed message itself, not a rebuilt copy.
+  //
+  // The Chat client hides an inbox row by the id it claimed (`currentClaimed`).
+  // `createUserMessage()` mints a fresh id, so a rebuilt message never matches
+  // the row the user already sees and the prompt renders twice until the turn
+  // closes. The stock `agent-loop` appends the claimed message unchanged.
+  session.append('user/message', input.message, { surfaceOp: 'append' })
   const query = await startQuery(input.ctx, {
     command: input.command,
     args: input.args,
@@ -89,6 +94,29 @@ export async function runCliTurn(input: {
   let chunkIndex = 0
   const dispatch = agentEvents(input.ctx, input.agent)
   let started = false
+  /**
+   * Step boundary bookkeeping.
+   *
+   * The Chat client keeps an assistant message's transient stream rows until
+   * the Step that owns it ends, so it can retire them and reveal the durable
+   * message in their place. A driver that never records `step/end` leaves both
+   * visible at once, which reads as the same reply printed twice until the turn
+   * closes. The stock `agent-loop` brackets every step with `step/start` and
+   * `step/end`; this driver has to do the same.
+   */
+  let openStep: number | undefined
+  const stepStart = (value: number): void => {
+    if (openStep === value) return
+    if (openStep !== undefined) session.append('step/end', { turn: input.turn, step: openStep })
+    session.append('step/start', { turn: input.turn, step: value })
+    openStep = value
+  }
+  const stepEnd = (value?: number): void => {
+    const closing = value ?? openStep
+    if (closing === undefined) return
+    session.append('step/end', { turn: input.turn, step: closing })
+    if (openStep === closing) openStep = undefined
+  }
   const finishLive = (seq: number | undefined): void => {
     if (!started) return
     dispatch.emit('agent/assistant-stream', {
@@ -148,14 +176,22 @@ export async function runCliTurn(input: {
         } else if (event.kind === 'assistant') {
           const text = event.blocks.filter(block => block.type === 'text').map(block => block.text).join('')
           if (text !== '') committed.push(text)
+          // Open the step before its message lands: the client matches a
+          // settlement to the attempt by turn and step, so the message must
+          // belong to a step the reader has already seen start.
+          stepStart(step)
           const seq = appendAssistant(session, input.turn, step, event.blocks, usage, input.recordModel)
           finishLive(seq)
+          // Close it before the next step inherits the same transient rows.
+          stepEnd(step)
           step += 1
         } else if (event.kind === 'tool-call') {
+          stepStart(step)
           session.append('tool/call', {
             turn: input.turn, step, callId: ToolCallId(event.id), name: event.name, arguments: event.arguments,
           })
         } else if (event.kind === 'tool-result') {
+          stepStart(step)
           const call = findCall(session, event.id) ?? previousSeq(session)
           session.append('tool/result', {
             turn: input.turn,
@@ -179,6 +215,9 @@ export async function runCliTurn(input: {
     input.signal.removeEventListener('abort', stopReading)
     input.signal.removeEventListener('abort', abortQuery)
     finishLive(undefined)
+    // A turn that ends mid-step (abort, protocol fault, CLI exit) would
+    // otherwise leave the client's transient rows unreleased.
+    stepEnd()
     if (input.signal.aborted) {
       // Record the turn boundary before any teardown wait. The CLI may ignore
       // SIGTERM for the whole grace period, and a user asking to stop must not
@@ -603,6 +642,7 @@ export class CodeBuddyAgent implements Agent {
           agent: this,
           session: this.session,
           turn: this.turn,
+          message,
           prompt: text,
           creator,
           command: this.launch.command,
