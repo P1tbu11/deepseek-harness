@@ -64,7 +64,7 @@ try {
   })
   assert.equal(selected.selected.provider, 'codebuddy')
   assert.equal(selected.selected.model, 'cli-default')
-  await ctx.agentDefaultModel.saveSelection(selected.selected)
+  await ctx.agentDefaultModel.saveSelection({ provider: selected.selected.provider, model: selected.selected.model })
   assert.equal(ctx.agentDefaultModel.currentSelection().provider, 'codebuddy')
   await prompt(agent, 'still this session')
   assert.match(reason(agent), /previous request model is preserved/)
