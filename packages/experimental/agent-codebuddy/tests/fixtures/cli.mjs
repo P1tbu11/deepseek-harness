@@ -156,6 +156,43 @@ if (scenario === 'chat') {
     send({ type: 'control_response', response: { subtype: 'success', request_id: reply.request_id, response: { ack: true } } })
   }
   await new Promise(() => {})
+} else if (scenario === 'thinking') {
+  // Model is mid-stream with no further output: silence, then no result. The
+  // peer also ignores `interrupt`, so only process termination ends it.
+  if (process.env.CODEBUDDY_CHILD_PID_FILE) writeFileSync(process.env.CODEBUDDY_CHILD_PID_FILE, String(process.pid))
+  send({
+    type: 'assistant',
+    session_id: sessionId(),
+    message: { content: [{ type: 'thinking', thinking: 'pondering a long answer' }] },
+  })
+  send({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '思考' } } })
+  for (;;) {
+    const line = await nextLine()
+    if (line === undefined) break
+    if (line?.request?.subtype === 'interrupt') {
+      send({ type: 'control_response', response: { subtype: 'success', request_id: line.request_id, response: { ack: true } } })
+    }
+  }
+  await new Promise(() => {})
+} else if (scenario === 'stubborn') {
+  // Streaming, no result, and ignores SIGTERM so teardown must escalate after
+  // graceMs. A user stop must still end the turn without waiting for that.
+  if (process.env.CODEBUDDY_CHILD_PID_FILE) writeFileSync(process.env.CODEBUDDY_CHILD_PID_FILE, String(process.pid))
+  process.on('SIGTERM', () => {})
+  send({
+    type: 'assistant',
+    session_id: sessionId(),
+    message: { content: [{ type: 'thinking', thinking: 'stubborn stream' }] },
+  })
+  send({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '思考' } } })
+  for (;;) {
+    const line = await nextLine()
+    if (line === undefined) break
+    if (line?.request?.subtype === 'interrupt') {
+      send({ type: 'control_response', response: { subtype: 'success', request_id: line.request_id, response: { ack: true } } })
+    }
+  }
+  await new Promise(() => {})
 } else if (scenario === 'creator') {
   send({
     type: 'control_request',

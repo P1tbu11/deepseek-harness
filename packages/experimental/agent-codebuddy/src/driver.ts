@@ -73,8 +73,9 @@ export async function runCliTurn(input: {
     prompt: input.prompt,
     graceMs: input.graceMs,
   })
-  const abortQuery = () => { void query.cancel() }
+  const abortQuery = () => { query.terminate() }
   input.signal.addEventListener('abort', abortQuery, { once: true })
+  if (input.signal.aborted) abortQuery()
   const projector = new Projector()
   const committed: string[] = []
   let usage: TokenUsage | undefined
@@ -101,10 +102,22 @@ export async function runCliTurn(input: {
     revision += 1
     chunkIndex = 0
   }
+  // `for await` on a quiet CLI blocks until a line arrives or the process
+  // exits, which can be a whole SIGTERM grace period after a stop. Race each
+  // read against the abort signal so the turn ends when the user asks.
+  const closed = new AbortController()
+  const stopReading = (): void => { closed.abort() }
   try {
     if (input.signal.aborted) throw abortError()
-    for await (const message of query.messages) {
-      if (input.signal.aborted) break
+    input.signal.addEventListener('abort', stopReading, { once: true })
+    const lines = query.messages[Symbol.asyncIterator]()
+    for (;;) {
+      const next = await raceAbort(lines.next(), closed.signal)
+      if (next === undefined || next.done === true || input.signal.aborted) {
+        void lines.return?.(undefined)
+        break
+      }
+      const message = next.value
       if (message.type === 'control_request') {
         await answerControl(input, query, message, input.turn, step)
         continue
@@ -162,11 +175,18 @@ export async function runCliTurn(input: {
       if (fault !== undefined || events.some(event => event.kind === 'result')) break
     }
   } finally {
+    input.signal.removeEventListener('abort', stopReading)
     input.signal.removeEventListener('abort', abortQuery)
     finishLive(undefined)
     if (input.signal.aborted) {
-      await query.cancel()
-      session.append('turn/end', { turn: input.turn, reason: { kind: 'aborted', reason: { kind: 'user' } } })
+      // Record the turn boundary before any teardown wait. The CLI may ignore
+      // SIGTERM for the whole grace period, and a user asking to stop must not
+      // watch the UI stay "running" while the process is still being reaped.
+      query.terminate()
+      session.append('turn/end', {
+        turn: input.turn,
+        reason: { kind: 'aborted', reason: abortedCause(input.signal) },
+      })
     } else if (sawResult) {
       if (resultError) {
         session.append('turn/end', {
@@ -176,7 +196,7 @@ export async function runCliTurn(input: {
       } else {
         session.append('turn/end', { turn: input.turn, reason: { kind: 'completed' } })
       }
-      await query.stop()
+      query.terminate()
     } else {
       const done = await query.finished()
       if (fault !== undefined || done.exitCode !== 0 && done.exitCode !== null) {
@@ -197,6 +217,47 @@ export async function runCliTurn(input: {
 function previousSeq(session: Session): ReturnType<typeof SessionSeq> {
   const events = session.snapshotEvents()
   return events.at(-1)?.seq ?? SessionSeq(0)
+}
+
+/**
+ * Await one async-iterator step, or give up as soon as `signal` aborts.
+ * @param step - the pending read from a CLI stream.
+ * @param signal - aborts when the turn is cancelled.
+ * @returns the step result, or `undefined` once the signal aborted first.
+ */
+async function raceAbort<R>(
+  step: Promise<R>,
+  signal: AbortSignal,
+): Promise<R | undefined> {
+  if (signal.aborted) return undefined
+  const aborted = Promise.withResolvers<undefined>()
+  const onAbort = (): void => { aborted.resolve(undefined) }
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    return await Promise.race([step, aborted.promise])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Copy only the fields `turn/end` records from the cancel cause carried by an
+ * Agent-owned signal. The live reason may carry a `stack` that the log cannot.
+ * @param signal - the turn signal aborted by {@link Agent.cancel}.
+ * @returns the durable cancel cause, defaulting to a user stop.
+ */
+function abortedCause(signal: AbortSignal): AgentCancelCause {
+  const cause = signal.reason as AgentCancelCause | undefined
+  switch (cause?.kind) {
+    case 'user':
+    case 'parent':
+    case 'disposed':
+      return { kind: cause.kind }
+    case 'hook':
+      return { kind: 'hook', reason: cause.reason }
+    default:
+      return { kind: 'user' }
+  }
 }
 
 function appendAssistant(

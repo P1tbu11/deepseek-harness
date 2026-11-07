@@ -212,8 +212,9 @@ describe('CodeBuddy fixture sessions', () => {
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
-    expect(alive(pid)).toBe(false)
+    // The turn ends on `result`; teardown of the resident process follows it.
     expect(turnEnds(agent)).toEqual(['completed'])
+    expect(await waitForDeath(pid)).toBe(true)
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     expect(turnEnds(agent)).toEqual(['completed', 'completed'])
@@ -244,9 +245,46 @@ describe('CodeBuddy fixture sessions', () => {
     await new Promise(resolve => setTimeout(resolve, 300))
     const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
     expect(pid).toBeGreaterThan(0)
+    const started = Date.now()
     agent.cancel({ kind: 'user' })
     await agent.whenIdle()
-    expect(alive(pid)).toBe(false)
+    // A stop while the approval card is open must end the turn, not wait for an answer.
+    expect(turnEnds(agent)).toEqual(['aborted'])
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(await waitForDeath(pid)).toBe(true)
+  })
+
+  it('ends an aborted turn without waiting for a CLI that ignores SIGTERM', async () => {
+    const { agent, dir } = await bootCodeBuddy('stubborn')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'a long question' }], source: { kind: 'user' } }))
+    await waitForEvent(agent, 'assistant/message')
+    const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
+    const started = Date.now()
+    agent.cancel({ kind: 'user' })
+    await agent.whenIdle()
+    const elapsed = Date.now() - started
+    // The default grace is 3000ms; waiting for a graceful exit would take that long.
+    expect(elapsed).toBeLessThan(2000)
+    // The decisive part: the turn boundary is durable while teardown is still
+    // running. Otherwise the UI keeps showing the turn as active.
+    expect(turnEnds(agent)).toEqual(['aborted'])
+    expect(alive(pid)).toBe(true)
+    expect(await waitForDeath(pid)).toBe(true)
+  })
+
+  it('stops a streaming turn when the user cancels and terminates the CLI', async () => {
+    const { agent, dir } = await bootCodeBuddy('thinking')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'a long question' }], source: { kind: 'user' } }))
+    await waitForEvent(agent, 'assistant/message')
+    const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
+    expect(alive(pid)).toBe(true)
+    const started = Date.now()
+    agent.cancel({ kind: 'user' })
+    await agent.whenIdle()
+    const elapsed = Date.now() - started
+    expect(turnEnds(agent)).toEqual(['aborted'])
+    expect(elapsed).toBeLessThan(5000)
+    expect(await waitForDeath(pid)).toBe(true)
   })
 
   it('lets a creator-mode CodeBuddy session discover and call plugin_manager once', async () => {
@@ -315,6 +353,30 @@ describe('DeepSeek sessions and profile shape', () => {
 
 function turnEnds(agent: Agent): string[] {
   return agent.session.snapshotEvents().flatMap(event => event.type === 'turn/end' ? [event.data.reason.kind] : [])
+}
+
+/** Resolve once the Session log contains the named event type. */
+async function waitForEvent(agent: Agent, type: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (agent.session.snapshotEvents().some(event => event.type === type)) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`timed out waiting for session event "${type}"`)
+}
+
+/**
+ * Wait for a terminated process tree to stop being observable. Teardown runs
+ * after the turn ends, so a stop is prompt for the caller while the provider
+ * still walks its TERM-then-KILL ladder.
+ */
+async function waitForDeath(pid: number, timeoutMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!alive(pid)) return true
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  return false
 }
 
 function alive(pid: number): boolean {

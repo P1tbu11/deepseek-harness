@@ -10,9 +10,13 @@ export interface CliQuery {
   readonly sent: readonly unknown[]
   /** Write one more NDJSON line. Used for permission and bridge replies. */
   send(value: unknown): void
-  cancel(): Promise<void>
-  /** Stop the process after a turn result. Does not send `interrupt`. */
-  stop(): Promise<void>
+  /**
+   * Send `interrupt` when the pipe still accepts it, then start the provider's
+   * termination ladder. Returns without awaiting exit so a caller can end its
+   * turn immediately: the provider still escalates to SIGKILL after `graceMs`,
+   * and owns the range until it is empty.
+   */
+  terminate(): void
   finished(): Promise<{ readonly exitCode: number | null; readonly stderr: string }>
 }
 
@@ -44,6 +48,9 @@ export async function startQuery(ctx: Context, input: {
     graceMs: input.graceMs,
   })
   const sent: unknown[] = []
+  // A stopped CLI closes stdin; later writes (interrupt, permission replies)
+  // must not surface as an unhandled EPIPE on the host stream.
+  handle.stdin?.on('error', () => { /* stdin is best-effort after termination */ })
   const write = (value: unknown): void => {
     sent.push(value)
     handle.stdin?.write(`${JSON.stringify(value)}\n`)
@@ -68,19 +75,19 @@ export async function startQuery(ctx: Context, input: {
     messages,
     sent,
     send: write,
-    cancel: async () => {
-      write({
-        type: 'control_request',
-        request_id: 'interrupt',
-        request: { subtype: 'interrupt', reason: 'User interrupt' },
-      })
-      await new Promise(resolve => setTimeout(resolve, 50))
+    terminate: () => {
+      // `interrupt` is a courtesy: the CLI may be mid-stream and either ignores
+      // it or has already closed stdin. Termination owns the guarantee.
+      try {
+        write({
+          type: 'control_request',
+          request_id: 'interrupt',
+          request: { subtype: 'interrupt', reason: 'User interrupt' },
+        })
+      } catch {
+        // A closed stdin means the CLI is already going away.
+      }
       handle.terminate()
-      await handle.waitForExit().catch(() => false)
-    },
-    stop: async () => {
-      handle.terminate()
-      await handle.waitForExit().catch(() => false)
     },
     finished: async () => {
       const outcome = await handle.done.catch(() => ({ exitCode: null, signal: 'SIGKILL' as const }))
