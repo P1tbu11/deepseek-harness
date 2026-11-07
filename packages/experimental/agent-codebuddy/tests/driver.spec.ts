@@ -1,0 +1,260 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { afterEach, describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { apply as applyPluginTools } from '@deepseek-ai/dsh-plugin-manager/tools'
+import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import { readFileSync } from 'node:fs'
+import CodeBuddyLoop from '../src/index.ts'
+import CodeBuddySettings from '../src/settings.ts'
+
+const fixture = fileURLToPath(new URL('./fixtures/cli.mjs', import.meta.url))
+const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+const preset = readFileSync(new URL('../../../bundle/web-app/presets/cordis.patch.yml', import.meta.url), 'utf8')
+
+class MockAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
+    const text = 'deepseek-ok'
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+async function harness(
+  config: Record<string, unknown>,
+  decision: 'allowed-once' | 'rejected' | 'hold' = 'allowed-once',
+) {
+  const dir = await mkdtemp(join(tmpdir(), 'codebuddy-'))
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(LocalSubprocess)
+  await ctx.plugin(ApprovalService)
+  ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write' }) })
+  ctx.provide('pluginManager', {
+    listPlugins: async () => [{ id: 'tool-plugin-manager', name: '@deepseek-ai/dsh-plugin-manager/tools' }],
+    listBundles: async () => [],
+  })
+  applyPluginTools(ctx)
+  ctx.on('approval/request', () => decision === 'hold' ? new Promise(() => {}) : Promise.resolve(decision))
+  const adapter = new MockAdapter()
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await ctx.plugin(CodeBuddySettings, { stateDir: dir, ...config })
+  await ctx.plugin(CodeBuddyLoop, { agents: [] })
+  return { ctx, dir, adapter, async stop() { await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }) } }
+}
+
+const dirs: { stop(): Promise<void> }[] = []
+afterEach(async () => {
+  await Promise.all(dirs.splice(0).map(item => item.stop()))
+  delete process.env.CODEBUDDY_FIXTURE
+  delete process.env.CODEBUDDY_ARGV_LOG
+  delete process.env.CODEBUDDY_CHILD_PID_FILE
+})
+
+function codebuddyConfig(dir: string) {
+  return {
+    enabled: true,
+    command: process.execPath,
+    args: [fixture],
+    probe: false,
+    stateDir: dir,
+  }
+}
+
+async function bootCodeBuddy(
+  scenario: string,
+  decision: 'allowed-once' | 'rejected' | 'hold' = 'allowed-once',
+) {
+  const dir = await mkdtemp(join(tmpdir(), 'codebuddy-run-'))
+  process.env.CODEBUDDY_FIXTURE = scenario
+  process.env.CODEBUDDY_ARGV_LOG = join(dir, 'argv.log')
+  process.env.CODEBUDDY_CHILD_PID_FILE = join(dir, 'child.pid')
+  const started = await harness(codebuddyConfig(dir), decision)
+  dirs.push({ stop: async () => { await started.stop(); await rm(dir, { recursive: true, force: true }) } })
+  const handle = await started.ctx.agents.create({
+    sessionId: SessionId(`cb-${scenario}-${decision}`),
+    agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+    meta: { cwd: dir, agentPreset: scenario === 'creator' ? 'cordis' : 'standard' },
+  })
+  return { ...started, dir, agent: handle.agent }
+}
+
+function texts(agent: Agent): string[] {
+  return agent.session.snapshotEvents().flatMap((event) => {
+    if (event.type !== 'assistant/message') return []
+    return event.data.message.content.flatMap(block => block.type === 'text' ? [block.text] : [])
+  })
+}
+
+describe('CodeBuddy fixture sessions', () => {
+  it('replays two turns through one CLI session id and does not duplicate streamed text', async () => {
+    const { agent, dir } = await bootCodeBuddy('chat')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(texts(agent)).toEqual(['你好', 'done ```js\nconst x = 1\n```', '你好', 'done ```js\nconst x = 1\n```'])
+    expect(JSON.stringify(agent.session.snapshotEvents())).not.toContain('do-not-persist')
+    const calls = agent.session.snapshotEvents().filter(event => event.type === 'tool/call')
+    expect(calls.map(event => event.type === 'tool/call' ? event.data.callId : '')).toEqual(['toolu_1', 'toolu_1'])
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(argv[0]?.includes('--resume')).toBe(false)
+    expect(argv[1]).toContain('--resume')
+    expect(argv[1]).toContain('cli-sess-1')
+    expect(argv[0]?.includes('--system-prompt')).toBe(false)
+  })
+
+  it('resumes the same CLI session from a new factory instance', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codebuddy-resume-'))
+    process.env.CODEBUDDY_FIXTURE = 'chat'
+    process.env.CODEBUDDY_ARGV_LOG = join(dir, 'argv.log')
+    const first = await harness(codebuddyConfig(dir))
+    const created = await first.ctx.agents.create({
+      sessionId: SessionId('cb-resume'),
+      agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+      meta: { cwd: dir },
+    })
+    created.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await created.agent.whenIdle()
+    await first.ctx.fiber.dispose()
+    const second = await harness(codebuddyConfig(dir))
+    dirs.push(first, second, { stop: async () => rm(dir, { recursive: true, force: true }) })
+    const resumed = await second.ctx.agents.resume({
+      resumeSessionId: SessionId('cb-resume'),
+      agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+    })
+    resumed.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'again' }], source: { kind: 'user' } }))
+    await resumed.agent.whenIdle()
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(argv.at(-1)).toContain('cli-sess-1')
+  })
+
+  it.each(['allowed-once', 'rejected'] as const)('returns the human %s decision to the fixture', async (decision) => {
+    const { agent } = await bootCodeBuddy('permission', decision)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'echo hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const result = agent.session.snapshotEvents().find(event => event.type === 'tool/result')
+    expect(result?.type === 'tool/result' ? result.data.message.content : []).toEqual([
+      { type: 'text', text: decision === 'allowed-once' ? 'allowed' : 'denied' },
+    ])
+    const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
+    expect(end?.type === 'turn/end' ? end.data.reason.kind : '').toBe('completed')
+  })
+
+  it('kills the fixture and its child when approval is cancelled', async () => {
+    const { agent, dir } = await bootCodeBuddy('hang', 'hold')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'sleep' }], source: { kind: 'user' } }))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
+    expect(pid).toBeGreaterThan(0)
+    agent.cancel({ kind: 'user' })
+    await agent.whenIdle()
+    expect(alive(pid)).toBe(false)
+  })
+
+  it('lets a creator-mode CodeBuddy session discover and call plugin_manager once', async () => {
+    const { agent } = await bootCodeBuddy('creator')
+    agent.session.append('agent-preset/selected', { agentPreset: 'cordis' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'list plugins' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const text = texts(agent).join('\n')
+    expect(text).toContain('tool-plugin-manager')
+    expect(text).not.toContain('secret')
+    const calls = agent.session.snapshotEvents().filter(event => event.type === 'tool/call')
+    expect(calls.map(event => event.type === 'tool/call' ? event.data.name : '')).toEqual(['plugin_manager'])
+  })
+
+  it('does not treat an unknown event as success or store its payload', async () => {
+    const { agent } = await bootCodeBuddy('unknown')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
+    expect(end?.type === 'turn/end' ? end.data.reason : {}).toMatchObject({ kind: 'error', error: { code: 'UNKNOWN_PROTOCOL' } })
+    expect(JSON.stringify(agent.session.snapshotEvents())).not.toContain('secret-token')
+    expect(JSON.stringify(agent.session.snapshotEvents())).not.toContain('should-not-win')
+  })
+
+  it('reports a non-zero exit and redacts stderr', async () => {
+    const { agent } = await bootCodeBuddy('fail')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
+    const reason = end?.type === 'turn/end' ? end.data.reason : undefined
+    expect(reason?.kind).toBe('error')
+    if (reason?.kind === 'error') {
+      expect(reason.error.message).toContain('CLI_EXIT')
+      expect(reason.error.message).toContain('[redacted]')
+      expect(reason.error.message).not.toContain('abc123')
+    }
+  })
+})
+
+describe('DeepSeek sessions and profile shape', () => {
+  it('keeps a non-codebuddy session on the default loop', async () => {
+    const started = await harness({ enabled: false, probe: false })
+    dirs.push(started)
+    const handle = await started.ctx.agents.create({
+      sessionId: SessionId('deepseek-1'),
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
+    await handle.agent.whenIdle()
+    expect(texts(handle.agent)).toEqual(['deepseek-ok'])
+    expect(started.adapter.requests).toHaveLength(1)
+    expect(started.ctx.tools.executable('plugin_manager')).toBeDefined()
+  })
+
+  it('registers one factory and keeps the creator preset row addressable', async () => {
+    const started = await harness({ enabled: false, probe: false })
+    dirs.push(started)
+    await expect(started.ctx.plugin(AgentLoop, { agents: [] })).rejects.toThrow(/agentLoop/)
+    const base = [
+      { id: 'agent-loop', name: '@deepseek-ai/dsh-agent-loop' },
+      { id: 'preset-cordis', name: '@deepseek-ai/dsh-agent-preset' },
+    ]
+    const composed = applyEntryPatches(base, [
+      { id: 'agent-loop', disabled: true },
+      { insert: [{ id: 'agent-codebuddy', name: '@deepseek-ai/dsh-agent-codebuddy' }] },
+    ], () => {})
+    expect(composed.find(entry => entry.id === 'agent-loop')?.disabled).toBe(true)
+    expect(composed.find(entry => entry.id === 'agent-codebuddy')?.name).toBe('@deepseek-ai/dsh-agent-codebuddy')
+    expect(composed.find(entry => entry.id === 'preset-cordis')).toBeDefined()
+    expect(patch).toContain('disabled: true')
+    expect(preset).toContain('tool-plugin-manager')
+    expect(preset).toContain('@deepseek-ai/dsh-plugin-manager/tools')
+  })
+})
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}

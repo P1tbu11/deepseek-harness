@@ -1,0 +1,106 @@
+import { createInterface } from 'node:readline'
+import type { Context } from '@deepseek-ai/cordis'
+import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
+import { initializeRequest, launchArgs, type ProtocolMessage } from './protocol.ts'
+
+/** A running CLI query. `finished` resolves only after the process group is gone. */
+export interface CliQuery {
+  readonly messages: AsyncIterable<ProtocolMessage>
+  /** CLI lines written by the host, for tests. */
+  readonly sent: readonly unknown[]
+  /** Write one more NDJSON line. Used for permission and bridge replies. */
+  send(value: unknown): void
+  cancel(): Promise<void>
+  finished(): Promise<{ readonly exitCode: number | null; readonly stderr: string }>
+}
+
+/**
+ * Spawn the configured CLI and speak stream-json. Interrupt acknowledgement
+ * does not count as exit; `cancel` always terminates the managed process range.
+ * @param ctx - context whose subprocess service owns the process group.
+ * @param input - executable, arguments, directory, and creator-mode flag.
+ * @returns the live query.
+ */
+export async function startQuery(ctx: Context, input: {
+  readonly command: string
+  readonly args: readonly string[]
+  readonly cwd: string
+  readonly resume?: string
+  readonly model?: string
+  readonly creator: boolean
+  readonly prompt: string
+  readonly graceMs: number
+}): Promise<CliQuery> {
+  const handle = ctx.subprocess.spawn({
+    argv: [input.command, ...input.args, ...launchArgs({
+      ...input.resume !== undefined && input.resume !== '' ? { resume: input.resume } : {},
+      ...input.model !== undefined && input.model !== '' ? { model: input.model } : {},
+      partial: true,
+    })],
+    cwd: input.cwd,
+    stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+    graceMs: input.graceMs,
+  })
+  const sent: unknown[] = []
+  const write = (value: unknown): void => {
+    sent.push(value)
+    handle.stdin?.write(`${JSON.stringify(value)}\n`)
+  }
+  let stderr = ''
+  handle.stderr?.on('data', (chunk: Buffer | string) => {
+    stderr = `${stderr}${chunk.toString()}`.slice(-4000)
+  })
+  const messages = readMessages(handle)
+  write({
+    type: 'control_request',
+    request_id: 'init',
+    request: initializeRequest(input.creator),
+  })
+  write({
+    type: 'user',
+    session_id: '',
+    message: { role: 'user', content: input.prompt },
+    parent_tool_use_id: null,
+  })
+  return {
+    messages,
+    sent,
+    send: write,
+    cancel: async () => {
+      write({
+        type: 'control_request',
+        request_id: 'interrupt',
+        request: { subtype: 'interrupt', reason: 'User interrupt' },
+      })
+      await new Promise(resolve => setTimeout(resolve, 50))
+      handle.terminate()
+      await handle.waitForExit().catch(() => false)
+    },
+    finished: async () => {
+      const outcome = await handle.done.catch(() => ({ exitCode: null, signal: 'SIGKILL' as const }))
+      return { exitCode: outcome.exitCode, stderr: redact(stderr) }
+    },
+  }
+}
+
+async function* readMessages(handle: SubprocessHandle): AsyncIterable<ProtocolMessage> {
+  if (handle.stdout === undefined) return
+  const lines = createInterface({ input: handle.stdout, crlfDelay: Infinity })
+  for await (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    try {
+      yield JSON.parse(trimmed) as ProtocolMessage
+    } catch {
+      yield { type: 'error', error: 'stdout line is not JSON' }
+    }
+  }
+}
+
+/** Drop obvious credential material from a diagnostic tail. */
+export function redact(text: string): string {
+  return text
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/(api[_-]?key|token|secret)(["']?\s*[:=]\s*["']?)[^"',\s}]+/gi, '$1$2[redacted]')
+}
