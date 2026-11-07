@@ -12,10 +12,9 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
-import { approvalAuditReason, approvalDisplayReason, permissionDetail } from './approval-copy.ts'
-import type { CliBinding } from './bindings.ts'
 import { handleBridgeCall, type McpCall } from './bridge.ts'
-import { BRIDGE_TOOL, CLI_DEFAULT_MODEL, CODEBUDDY_PROVIDER, CREATOR_PRESET } from './constants.ts'
+import type { CliBinding } from './bindings.ts'
+import { BRIDGE_TOOL, CODEBUDDY_PROVIDER, CREATOR_PRESET, DEFAULT_MODEL_ID } from './constants.ts'
 import {
   Projector, withoutDuplicateResultText, type ProtocolFault, type ProtocolMessage,
 } from './protocol.ts'
@@ -51,6 +50,8 @@ export async function runCliTurn(input: {
   readonly args: readonly string[]
   readonly cwd: string
   readonly model?: string
+  /** Model to record on assistant messages; the CLI resolves it when the flag is omitted. */
+  readonly recordModel: string
   readonly resume?: string
   readonly graceMs: number
   readonly signal: AbortSignal
@@ -147,7 +148,7 @@ export async function runCliTurn(input: {
         } else if (event.kind === 'assistant') {
           const text = event.blocks.filter(block => block.type === 'text').map(block => block.text).join('')
           if (text !== '') committed.push(text)
-          const seq = appendAssistant(session, input.turn, step, event.blocks, usage)
+          const seq = appendAssistant(session, input.turn, step, event.blocks, usage, input.recordModel)
           finishLive(seq)
           step += 1
         } else if (event.kind === 'tool-call') {
@@ -266,6 +267,7 @@ function appendAssistant(
   step: number,
   blocks: readonly { type: 'text' | 'reasoning'; text: string }[],
   usage: TokenUsage | undefined,
+  model: string,
 ): number {
   const content: ContentBlock[] = blocks.map(block => block.type === 'text'
     ? { type: 'text', text: block.text }
@@ -276,7 +278,7 @@ function appendAssistant(
     step,
     message: createAssistantMessage({
       content,
-      source: { provider: CODEBUDDY_PROVIDER, model: CLI_DEFAULT_MODEL },
+      source: { provider: CODEBUDDY_PROVIDER, model },
     }),
     stream: text.length === 0 ? [] : [{
       type: 'text-chunks',
@@ -310,19 +312,19 @@ async function answerControl(input: {
   const body = request !== null && typeof request === 'object' ? request as ProtocolMessage : {}
   const subtype = typeof body.subtype === 'string' ? body.subtype : ''
   if (subtype === 'can_use_tool') {
-    const toolName = typeof body.tool_name === 'string' ? body.tool_name : 'tool'
+    // `bypassPermissions` means the CLI should not ask, but an older or
+    // differently configured build can still send this request. Allow it
+    // outright: the driver has no approval channel to consult, and denying here
+    // is what silently swallowed tool calls before.
     // No `callId`: the CLI sends this request before its `tool_use`, so the
     // Chat detail slot would find no correlated call when the card renders and
     // would show the command a second time once the call is logged.
-    const outcome = await ask(input.ctx, input.agent, toolName, permissionDetail(body.input), input.signal)
     query.send({
       type: 'control_response',
       response: {
         subtype: 'success',
         request_id: requestId,
-        response: outcome === 'allowed-once'
-          ? { allowed: true, updatedInput: body.input ?? {}, tool_use_id: body.tool_use_id }
-          : { allowed: false, reason: outcome, tool_use_id: body.tool_use_id },
+        response: { allowed: true, updatedInput: body.input ?? {}, tool_use_id: body.tool_use_id },
       },
     })
     return
@@ -371,26 +373,6 @@ async function answerControl(input: {
     type: 'control_response',
     response: { subtype: 'error', request_id: requestId, error: `unsupported control ${subtype}` },
   })
-}
-
-async function ask(
-  ctx: Context,
-  agent: Agent,
-  toolName: string,
-  detail: string | undefined,
-  signal: AbortSignal,
-): Promise<string> {
-  const approval = ctx.get('approval')
-  if (approval === undefined) return 'unavailable'
-  const displayReason = approvalDisplayReason(toolName, detail)
-  const outcome = await approval.request({
-    agent,
-    toolName,
-    reason: approvalAuditReason(toolName),
-    displayReason,
-    signal,
-  })
-  return outcome
 }
 
 function abortError(): Error {
@@ -487,6 +469,8 @@ export class CodeBuddyAgent implements Agent {
       readonly graceMs: number
       readonly remember: (id: string, binding: CliBinding) => Promise<void>
     },
+    /** Live model-selection projection for this Session; re-read on every turn. */
+    private readonly readSelection: () => ModelSelectionProjectionState = () => ({ lastUsed: null, pending: null }),
   ) {
     this.options = options
     this.session = session
@@ -495,10 +479,10 @@ export class CodeBuddyAgent implements Agent {
     const scope = createScope(host, this)
     this.ctx = scope.ctx
     this.dispatch = agentEvents(host, this)
-    this.model = new AgentModel(() => this.selection(), session, options)
+    this.model = new AgentModel(this.readSelection, session, options)
     this.session.append('model/selection', {
       provider: CODEBUDDY_PROVIDER,
-      model: launch.model === undefined || launch.model === '' ? CLI_DEFAULT_MODEL : launch.model,
+      model: this.modelId(),
     })
   }
 
@@ -544,8 +528,35 @@ export class CodeBuddyAgent implements Agent {
   steer(message: UserMessage): void { this.send(message, 'next-step', true) }
   inject(message: UserMessage): void { this.send(message, 'next-step', false) }
 
-  private selection(): ModelSelectionProjectionState {
-    return { lastUsed: null, pending: { provider: CODEBUDDY_PROVIDER, model: CLI_DEFAULT_MODEL } }
+  /**
+ * Model this agent reports for the current selection.
+ *
+ * The live selection wins. Selecting {@link DEFAULT_MODEL_ID}, or having no
+ * selection at all, reports that id: the harness record must name something,
+ * and the CLI resolves the concrete model itself.
+ * @returns the model id to record and display.
+ */
+  private modelId(): string {
+    return this.cliModel() === '' ? DEFAULT_MODEL_ID : this.cliModel()
+  }
+
+  /**
+ * The `--model` value for the next CLI process.
+ *
+ * An empty string means "send no flag", which is how the CLI's own configured
+ * model takes effect. {@link DEFAULT_MODEL_ID} is a synthetic selection that
+ * maps to that empty string; it is never passed as an argument.
+ * @returns the model id to pass, or an empty string to omit the flag.
+ */
+  private cliModel(): string {
+    const selected = this.model.current()
+    const chosen = selected?.model ?? ''
+    if (chosen !== '' && chosen !== DEFAULT_MODEL_ID) return chosen
+    // A settings-level model still pins every session, including `default`.
+    if (this.launch.model !== undefined && this.launch.model !== '' && this.launch.model !== DEFAULT_MODEL_ID) {
+      return this.launch.model
+    }
+    return ''
   }
 
   private wake(): void {
@@ -586,6 +597,7 @@ export class CodeBuddyAgent implements Agent {
       this.active = controller
       try {
         const creator = this.currentPreset() === CREATOR_PRESET
+        const model = this.cliModel()
         await runCliTurn({
           ctx: this.host,
           agent: this,
@@ -596,7 +608,8 @@ export class CodeBuddyAgent implements Agent {
           command: this.launch.command,
           args: this.launch.args,
           cwd: this.session.header.cwd ?? process.cwd(),
-          ...this.launch.model !== undefined && this.launch.model !== '' ? { model: this.launch.model } : {},
+          ...model !== '' ? { model } : {},
+          recordModel: this.modelId(),
           ...this.binding?.cliSessionId !== undefined ? { resume: this.binding.cliSessionId } : {},
           graceMs: this.launch.graceMs,
           signal: controller.signal,

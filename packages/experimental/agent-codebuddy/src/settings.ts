@@ -13,8 +13,14 @@ export interface CodeBuddySettings {
   readonly probeTimeoutMs: number
   /** When false, an empty command fails instead of probing. */
   readonly probe: boolean
-  /** Optional CLI `--model`. Empty leaves the CLI's own model. */
+  /** Optional CLI `--model`. Empty follows the live selection or the CLI's own model. */
   readonly model: string
+  /** Explicit model list for the picker. Empty discovers the ids the CLI advertises. */
+  readonly models: readonly string[]
+  /** Absolute path to the CLI's `settings.json`, read for its configured default model. */
+  readonly cliSettingsPath: string
+  /** Deadline for the `--help` discovery run. */
+  readonly modelsTimeoutMs: number
   /** Directory for the CLI session map. Empty keeps the map in memory only. */
   readonly stateDir: string
   /** SIGTERM grace before the subprocess service escalates. */
@@ -35,6 +41,9 @@ export default class CodeBuddySettingsService extends Service {
     probeTimeoutMs: z.number().min(1).default(1500),
     probe: z.boolean().default(true),
     model: z.string().default(''),
+    models: z.array(z.string()).default([]),
+    cliSettingsPath: z.string().default(''),
+    modelsTimeoutMs: z.number().min(100).default(8000),
     stateDir: z.string().default(''),
     graceMs: z.number().min(1).default(3000),
   })

@@ -80,12 +80,14 @@ it('loads the delivered profile patch through the shipped headless Loader', asyn
       stateDir: dir,
     })
     expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(expect.arrayContaining(['deepseek-official', 'codebuddy']))
-    await expect(ctx.llm.listModels('codebuddy')).resolves.toEqual([
-      {
-        provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'],
-        badge: { text: { en: 'New session', zh: '新会话' }, tone: 'warning' },
-      },
+    // Discovery reads the fixture's `--help`, so the picker offers exactly the
+    // models that CLI advertises rather than a single placeholder.
+    const codebuddyModels = await ctx.llm.listModels('codebuddy')
+    expect(codebuddyModels[0]).toMatchObject({ id: 'default', name: 'Default', provider: 'codebuddy' })
+    expect(codebuddyModels.map(model => model.id)).toEqual([
+      'default', 'claude-sonnet-5', 'gemini-3.1-pro', 'deepseek-v4.1-flash', 'echo',
     ])
+    expect(codebuddyModels.every(model => model.provider === 'codebuddy')).toBe(true)
 
     const selection = () => ctx.agentDefaultModel.currentSelection()
     expect(selection()).toMatchObject({ provider: 'deepseek-official' })
@@ -101,8 +103,8 @@ it('loads the delivered profile patch through the shipped headless Loader', asyn
     expect(reason(deepseek.agent)).toMatch(/no API key|system\.node/)
     await expect(readFile(argvLog, 'utf8')).rejects.toThrow()
 
-    const codebuddyModel = (await ctx.llm.listModels('codebuddy'))[0]
-    expect(codebuddyModel?.id).toBe('cli-default')
+    const codebuddyModel = (await ctx.llm.listModels('codebuddy'))[1]
+    expect(codebuddyModel?.id).toBe('claude-sonnet-5')
     const codebuddy = await ctx.agents.create({
       sessionId: SessionId('codebuddy-loader'),
       agentOptions: { provider: 'codebuddy', model: codebuddyModel!.id },

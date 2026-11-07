@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest'
 import { initializeRequest, launchArgs, Projector } from '../src/protocol.ts'
 
 describe('launch arguments', () => {
-  it('does not forward a system prompt, a tool whitelist, or bypassPermissions', () => {
+  it('always bypasses CLI permissions and forwards no system prompt or tool whitelist', () => {
     const args = launchArgs({ partial: true, resume: 'cli-sess-1' })
     expect(args).toContain('--permission-mode')
-    expect(args).toContain('default')
+    // The driver never answers a permission question, so the CLI must not ask one.
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('bypassPermissions')
+    expect(args).not.toContain('default')
     expect(args).not.toContain('--system-prompt')
     expect(args).not.toContain('--append-system-prompt')
     expect(args).not.toContain('--tools')

@@ -65,9 +65,11 @@ pnpm exec vitest run packages/experimental/agent-codebuddy/tests
 | stderr | 写入退出诊断，并遮盖 bearer、`sk-` 和 `api_key` |
 | 终端字符格排版 | 不表示 |
 
-默认模式只发送用户文本。不传 `--system-prompt`、`--append-system-prompt`、`--tools` 或 `--dangerously-skip-permissions`。不传 `--setting-sources`，以便 CLI 继续用自己的登录和设置。`--permission-mode` 为 `default`。`can_use_tool` 调用 `ctx.approval.request`，没有审批服务时拒绝。没有默认放行。`result` 事件结束该回合，驱动随后停止进程。它不等待常驻 CLI 自己退出，assistant 文本也不结束回合。
+默认模式只发送用户文本。不传 `--system-prompt`、`--append-system-prompt`、`--tools` 或 `--dangerously-skip-permissions`。不传 `--setting-sources`，以便 CLI 继续用自己的登录和设置。`--permission-mode` 恒为 `bypassPermissions`：驱动对 `can_use_tool` 请求直接回放行，且没有可供询问的审批通道，因此一个会提问的模式会让每个受限工具都被拒绝，用户看到的就是一个静默失败的空回合。`result` 事件结束该回合，驱动随后停止进程。它不等待常驻 CLI 自己退出，assistant 文本也不结束回合。
 
-审批卡片用 `displayReason` 带上 CLI 请求里的操作内容（`command`、`file_path`、`path`、`pattern` 或 `url`），让人在看到具体命令后再决定。这段文字只用于展示，不写进 `approval/asked` 的审计字段，那里仍然只有工具名，避免把 CLI 输入里的凭据留在会话日志。回复始终是单次放行或拒绝；插件不透传也不保存 CLI 的 `permission_suggestions` / `updatedPermissions`，因此会话级规则只由 CLI 自己按 `--permission-mode` 处理。
+由于 CLI 从不发问，也就不存在审批卡片，没有逐工具的决定需要记录。某些 CLI 版本即使被 bypass 仍会发送 `can_use_tool`，此时驱动回复 `allowed: true` 并原样带回请求里的 `updatedInput`，避免旧版本或不同配置的二进制把回合挂住。插件不透传也不保存 CLI 的 `permission_suggestions` / `updatedPermissions`。
+
+停止会立即结束回合，包括模型正在流式输出或权限请求挂起时。驱动让每次 CLI 读取与回合信号竞速，而不是等待输出；它写入携带 Agent 传入取消原因的 `turn/end`，并在不等待进程退出的前提下启动 CLI 的终止阶梯，因此忽略 `SIGTERM` 的 CLI 也无法把回合拖满整个宽限期。进程范围仍由 provider 持有，并在宽限期后升级为 `SIGKILL`；只有回合边界是即时的。
 
 停止会立即结束回合，模型正在流式输出或审批卡片还开着时也一样。驱动把每次 CLI 读取与回合信号做竞速，而不是干等输出；它用 Agent 传入的取消原因写 `turn/end`，并在启动 CLI 终止阶梯后不等进程退出，所以即使 CLI 忽略 `SIGTERM`，也不能把回合拖到整个 grace 周期。进程范围仍由 provider 持有并在必要时升级到 `SIGKILL`；只有回合边界是即时的。
 
@@ -152,7 +154,7 @@ DeepSeek 路线保持不变。
 - `file-history-snapshot` 不会被还原成文件内容。只有工具结果文本或正常的 workspace-changes 回合快照里已经有差异时才会显示。
 - 每个 DSH 回合启动一个 CLI 进程，下一回合使用 `--resume`。interrupt 的确认不算进程已退出。
 - 没有做 Web 视觉验收。工具行使用现有的 `tool/call` 卡片。
-- 通过的 fixture 按 `@tencent-ai/agent-sdk@0.3.244` 检查 stream-json 投影，以及一次 `plugin_manager` 发现和调用。它没有运行 CodeBuddy CLI 二进制、`install_bundle`、插件管理界面或热加载。审批仍然失败即拒绝，没有默认放行，也没有权限绕过。
+- 通过的 fixture 按 `@tencent-ai/agent-sdk@0.3.244` 检查 stream-json 投影，以及一次 `plugin_manager` 发现和调用。它没有运行 CodeBuddy CLI 二进制、`install_bundle`、插件管理界面或热加载。权限绕过 CLI 自身的门禁；fixture 仍会发送一次 `can_use_tool` 请求，用以证明驱动直接回放行，而不是去询问审批通道。
 - 投影不是无损复制。非文本用户输入会被拒绝。thinking 签名、被遮蔽的 thinking 和图片字节不会存储。`file-history-snapshot` 不会被重建成文件。
 
 <a id="dev-note"></a>

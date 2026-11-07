@@ -35,10 +35,7 @@ class MockAdapter extends LlmAdapter {
   }
 }
 
-async function harness(
-  config: Record<string, unknown>,
-  decision: 'allowed-once' | 'rejected' | 'hold' = 'allowed-once',
-) {
+async function harness(config: Record<string, unknown>) {
   const dir = await mkdtemp(join(tmpdir(), 'codebuddy-'))
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -63,7 +60,11 @@ async function harness(
   const approvals: ApprovalRequestEvent[] = []
   ctx.on('approval/request', (request) => {
     approvals.push(request)
-    return decision === 'hold' ? new Promise(() => {}) : Promise.resolve(decision)
+    // The CodeBuddy driver answers the CLI's own permission requests and never
+    // reaches this channel. DSH tools the bridge exposes do consult it, so keep
+    // the answer permissive; tests that assert the CLI path record any request
+    // here and fail if the driver ever starts asking.
+    return Promise.resolve('allowed-once')
   })
   const adapter = new MockAdapter()
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -97,19 +98,16 @@ function codebuddyConfig(dir: string) {
   }
 }
 
-async function bootCodeBuddy(
-  scenario: string,
-  decision: 'allowed-once' | 'rejected' | 'hold' = 'allowed-once',
-) {
+async function bootCodeBuddy(scenario: string) {
   const dir = await mkdtemp(join(tmpdir(), 'codebuddy-run-'))
   process.env.CODEBUDDY_FIXTURE = scenario
   process.env.CODEBUDDY_ARGV_LOG = join(dir, 'argv.log')
   process.env.CODEBUDDY_CHILD_PID_FILE = join(dir, 'child.pid')
-  const started = await harness(codebuddyConfig(dir), decision)
+  const started = await harness(codebuddyConfig(dir))
   dirs.push({ stop: async () => { await started.stop(); await rm(dir, { recursive: true, force: true }) } })
   const handle = await started.ctx.agents.create({
-    sessionId: SessionId(`cb-${scenario}-${decision}`),
-    agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+    sessionId: SessionId(`cb-${scenario}`),
+    agentOptions: { provider: 'codebuddy', model: 'default' },
     meta: { cwd: dir, agentPreset: scenario === 'creator' ? 'cordis' : 'standard' },
   })
   return { ...started, dir, agent: handle.agent }
@@ -150,7 +148,7 @@ describe('CodeBuddy fixture sessions', () => {
     const first = await harness(codebuddyConfig(dir))
     const created = await first.ctx.agents.create({
       sessionId: SessionId('cb-resume'),
-      agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+      agentOptions: { provider: 'codebuddy', model: 'default' },
       meta: { cwd: dir },
     })
     created.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
@@ -160,7 +158,7 @@ describe('CodeBuddy fixture sessions', () => {
     dirs.push(first, second, { stop: async () => rm(dir, { recursive: true, force: true }) })
     const resumed = await second.ctx.agents.resume({
       resumeSessionId: SessionId('cb-resume'),
-      agentOptions: { provider: 'codebuddy', model: 'cli-default' },
+      agentOptions: { provider: 'codebuddy', model: 'default' },
     })
     resumed.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'again' }], source: { kind: 'user' } }))
     await resumed.agent.whenIdle()
@@ -168,43 +166,37 @@ describe('CodeBuddy fixture sessions', () => {
     expect(argv.at(-1)).toContain('cli-sess-1')
   })
 
-  it.each(['allowed-once', 'rejected'] as const)('returns the human %s decision to the fixture', async (decision) => {
-    const { agent } = await bootCodeBuddy('permission', decision)
+  it('answers the CLI permission request with an allow, never an ask', async () => {
+    // `bypassPermissions` normally stops the CLI from asking. This drives the
+    // request anyway: the driver must allow it outright, because it has no
+    // approval channel to consult and denying is what silently swallowed turns.
+    const { agent, approvals } = await bootCodeBuddy('permission')
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'echo hi' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     const result = agent.session.snapshotEvents().find(event => event.type === 'tool/result')
     expect(result?.type === 'tool/result' ? result.data.message.content : []).toEqual([
-      { type: 'text', text: decision === 'allowed-once' ? 'allowed' : 'denied' },
+      { type: 'text', text: 'allowed' },
     ])
     const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
     expect(end?.type === 'turn/end' ? end.data.reason.kind : '').toBe('completed')
+    // No approval surfaced to the user, so the run cannot depend on one.
+    expect(approvals).toHaveLength(0)
   })
 
-  it('asks the human about the CLI command, not only the tool name', async () => {
-    const { agent, approvals } = await bootCodeBuddy('permission')
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'echo hi' }], source: { kind: 'user' } }))
+  it('launches the CLI with bypassPermissions in every turn', async () => {
+    const { agent, dir } = await bootCodeBuddy('chat')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
     await agent.whenIdle()
-    expect(approvals).toHaveLength(1)
-    expect(approvals[0]?.toolName).toBe('Bash')
-    expect(approvals[0]?.displayReason?.en).toContain('echo hi')
-    expect(approvals[0]?.displayReason?.zh).toContain('echo hi')
-    expect(approvals[0]?.displayReason?.ja).toContain('echo hi')
-    expect(approvals[0]?.reason).toBe('CodeBuddy CLI asks to use Bash')
-  })
-
-  it('keeps the CLI command out of the durable approval audit', async () => {
-    const { agent } = await bootCodeBuddy('permission')
-    const command = 'export TOKEN=hunter2 && curl -H "Authorization: Bearer hunter2" https://example.test'
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: command }], source: { kind: 'user' } }))
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
     await agent.whenIdle()
-    const approvalEvents = agent.session.snapshotEvents()
-      .filter(event => event.type === 'approval/asked' || event.type === 'approval/decided')
-    expect(JSON.stringify(approvalEvents)).not.toContain('hunter2')
-    const asked = agent.session.snapshotEvents().find(event => event.type === 'approval/asked')
-    expect(asked?.type === 'approval/asked' ? asked.data.reason : '').toBe('CodeBuddy CLI asks to use Bash')
-    // The call itself stays logged: the tool/call arguments are the model-visible record.
-    const call = agent.session.snapshotEvents().find(event => event.type === 'tool/call')
-    expect(call?.type === 'tool/call' ? call.data.arguments : '').toContain('hunter2')
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(argv.length).toBeGreaterThanOrEqual(2)
+    for (const line of argv) {
+      const at = line.indexOf('--permission-mode')
+      expect(at).toBeGreaterThanOrEqual(0)
+      expect(line[at + 1]).toBe('bypassPermissions')
+      expect(line).not.toContain('default')
+    }
   })
 
   it('ends the turn on result while the CLI process stays up, then stops that process', async () => {
@@ -239,8 +231,8 @@ describe('CodeBuddy fixture sessions', () => {
     expect(end?.type === 'turn/end' ? end.data.reason : {}).toMatchObject({ kind: 'error', error: { code: 'CLI_RESULT' } })
   })
 
-  it('kills the fixture and its child when approval is cancelled', async () => {
-    const { agent, dir } = await bootCodeBuddy('hang', 'hold')
+  it('kills the fixture and its child when the CLI stays silent after an allow', async () => {
+    const { agent, dir } = await bootCodeBuddy('hang')
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'sleep' }], source: { kind: 'user' } }))
     await new Promise(resolve => setTimeout(resolve, 300))
     const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'))
@@ -248,7 +240,8 @@ describe('CodeBuddy fixture sessions', () => {
     const started = Date.now()
     agent.cancel({ kind: 'user' })
     await agent.whenIdle()
-    // A stop while the approval card is open must end the turn, not wait for an answer.
+    // A stop while the CLI is still running must end the turn immediately,
+    // whatever it is waiting on, rather than block until the process exits.
     expect(turnEnds(agent)).toEqual(['aborted'])
     expect(Date.now() - started).toBeLessThan(2000)
     expect(await waitForDeath(pid)).toBe(true)
@@ -342,12 +335,34 @@ describe('DeepSeek sessions and profile shape', () => {
     expect(started.adapter.requests).toHaveLength(1)
     expect(started.ctx.tools.executable('plugin_manager')).toBeDefined()
     expect(started.ctx.llm.listProviders().map(provider => provider.id)).toContain('codebuddy')
-    await expect(started.ctx.llm.listModels('codebuddy')).resolves.toEqual([
-      {
-        provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'],
-        badge: { text: { en: 'New session', zh: '新会话' }, tone: 'warning' },
-      },
-    ])
+    // This profile names no CLI path, so discovery cannot run and the catalog
+    // falls back to the built-in snapshot. The synthetic default leads either way.
+    const models = await started.ctx.llm.listModels('codebuddy')
+    expect(models.length).toBeGreaterThan(1)
+    expect(models[0]).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text'] })
+  })
+
+  it('omits --model when the synthetic default is selected', async () => {
+    const { agent, dir } = await bootCodeBuddy('chat')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    // No --model flag at all, so the CLI resolves its own configured model.
+    // `default` can still appear inside the fixture's path, so the flag is what
+    // proves omission rather than the absence of the word.
+    expect(argv[0]?.indexOf('--model')).toBe(-1)
+  })
+
+  it('passes --model with the chosen id for a real model', async () => {
+    const { agent, dir, ctx } = await bootCodeBuddy('chat')
+    agent.model.select({ provider: 'codebuddy', model: 'gemini-3.1-pro' })
+    expect(agent.model.current()).toMatchObject({ provider: 'codebuddy', model: 'gemini-3.1-pro' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const argv = (await readFile(join(dir, 'argv.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+    expect(argv[0]).toContain('--model')
+    expect(argv[0]).toContain('gemini-3.1-pro')
+    expect(ctx).toBeDefined()
   })
 })
 

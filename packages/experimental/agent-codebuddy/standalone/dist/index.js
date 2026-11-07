@@ -1,8 +1,9 @@
+import { Service } from "@deepseek-ai/cordis";
+import { AgentModel, agentEvents, modelSelectionProjectionDefinition } from "@deepseek-ai/dsh-agent";
 import AgentLoop from "@deepseek-ai/dsh-agent-loop";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { LlmAdapter, LlmAttemptId, LlmError, ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
-import { AgentModel, agentEvents } from "@deepseek-ai/dsh-agent";
 import { createScope } from "@deepseek-ai/dsh-scope";
 import { SessionSeq } from "@deepseek-ai/dsh-session";
 import { createInterface } from "node:readline";
@@ -49,18 +50,162 @@ const CODEBUDDY_PROVIDER = "codebuddy";
 const CREATOR_PRESET = "cordis";
 /** Tool the creator-mode bridge exposes. Native CLI tools are not in this list. */
 const BRIDGE_TOOL = "plugin_manager";
-/** Display model recorded when the CLI keeps its own model selection. */
-const CLI_DEFAULT_MODEL = "cli-default";
+/**
+* Synthetic model id meaning "let the CLI pick".
+*
+* The provider advertises it first so a fresh session has an explicit choice
+* that round-trips to "pass no `--model`". The CLI then resolves the model from
+* its own settings, which is why selecting it must never send a real id.
+*
+* No CodeBuddy build lists this id, and discovery drops it if one ever does, so
+* a picker cannot end up with two entries carrying the same id.
+*/
+const DEFAULT_MODEL_ID = "default";
+//#endregion
+//#region lib/types/models.js
+/** Sentence the CLI uses to introduce the model ids it accepts. */
+const SUPPORTED_PREFIX = "Currently supported:";
+/** Model ids seen before the `--model` description added the supported list. */
+const BUILTIN_MODELS = [
+	"claude-sonnet-5",
+	"claude-sonnet-5-1m",
+	"claude-sonnet-4.6",
+	"claude-opus-5.5",
+	"claude-sonnet-5.5",
+	"claude-haiku-5.5",
+	"claude-opus-5",
+	"claude-opus-4.8-1m",
+	"claude-opus-4.7-1m",
+	"claude-opus-4.6-1m",
+	"gemini-3.1-pro",
+	"gemini-3.5-flash",
+	"gpt-6-astra",
+	"gpt-6.1-sol",
+	"gpt-6-sol",
+	"gpt-6-luna",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"glm-5.3-ioa",
+	"glm-5.3-flash-ioa",
+	"glm-5.3-flashx",
+	"glm-5.2-ioa",
+	"glm-5.2-internal-ioa",
+	"minimax-m3.1-flash",
+	"minimax-m3-ioa",
+	"minimax-m2.7-ioa",
+	"kimi-k3.1-pro",
+	"kimi-k3-ioa",
+	"kimi-k2.8-preview",
+	"hy4std",
+	"hy3-ioa",
+	"echo",
+	"deepseek-v4.1-flash",
+	"deepseek-v4-pro-ioa",
+	"mimo-v2.6-pro"
+];
+/**
+* Pull the supported model ids out of CLI help text.
+*
+* The synthetic default id is dropped: the catalog owns that row, and a CLI
+* that ever listed it would otherwise produce a duplicate picker entry.
+* @param help - combined stdout and stderr of `<cli> --help`.
+* @returns ids in the order the CLI printed them, without duplicates.
+*/
+function parseSupportedModels(help) {
+	const at = help.indexOf(SUPPORTED_PREFIX);
+	if (at < 0) return [];
+	const open = help.indexOf("(", at + 20);
+	if (open < 0) return [];
+	const close = help.indexOf(")", open + 1);
+	if (close < 0) return [];
+	const ids = help.slice(open + 1, close).split(",").map((entry) => entry.trim()).filter((entry) => entry !== "" && entry !== "default");
+	return [...new Set(ids)];
+}
+/**
+* Read the model named by the CLI's own settings file.
+*
+* This is the model a session uses when the harness passes no `--model`, so
+* the picker can show that value as the active default instead of inventing
+* a name the CLI would reject.
+* @param settingsPath - absolute path to the CLI's `settings.json`.
+* @returns the configured model id, or `''` when the file is absent or unreadable.
+*/
+async function readConfiguredModel(settingsPath) {
+	try {
+		const parsed = JSON.parse(await readFile(settingsPath, "utf8"));
+		if (parsed === null || typeof parsed !== "object") return "";
+		const model = parsed.model;
+		return typeof model === "string" ? model : "";
+	} catch {
+		return "";
+	}
+}
+const cache = /* @__PURE__ */ new Map();
+/**
+* Run `<cli> --help` once and read the CLI's configured model.
+* @param ctx - context whose subprocess service owns the child process.
+* @param input - absolute CLI path, settings path, and timeout.
+* @returns discovered ids and the configured default, both may be empty.
+*/
+async function discoverModels(ctx, input) {
+	const key = `${input.command}\u0000${input.args.join("\0")}\u0000${input.settingsPath}`;
+	const cached = cache.get(key);
+	if (cached !== void 0) return cached;
+	const configured = await readConfiguredModel(input.settingsPath);
+	const models = await readHelpModels(ctx, input.command, input.args, input.timeoutMs);
+	const result = {
+		models: models.length > 0 ? models : BUILTIN_MODELS,
+		configured
+	};
+	cache.set(key, result);
+	return result;
+}
+/** Spawn `<cli> --help` and parse its supported-model sentence. */
+async function readHelpModels(ctx, command, args, timeoutMs) {
+	let handle;
+	try {
+		handle = ctx.subprocess.spawn({
+			argv: [
+				command,
+				...args,
+				"--help"
+			],
+			cwd: process.cwd(),
+			stdio: {
+				stdin: "ignore",
+				stdout: { maxBytes: 1 << 20 },
+				stderr: { maxBytes: 1 << 20 }
+			},
+			graceMs: 1e3
+		});
+	} catch {
+		return [];
+	}
+	const timer = setTimeout(() => {
+		handle?.terminate();
+	}, timeoutMs);
+	try {
+		await handle.done;
+	} catch {
+		return [];
+	} finally {
+		clearTimeout(timer);
+	}
+	const collected = handle.collected;
+	return parseSupportedModels(`${collected.stdout?.readFrom(0).text ?? ""}\n${collected.stderr?.readFrom(0).text ?? ""}`);
+}
 //#endregion
 //#region lib/types/catalog.js
 /**
 * Publish `codebuddy` on the existing provider catalog.
 * Session creation still chooses the CLI driver. This adapter does not run a model call.
-* @param ctx - host context whose LLM registry the model picker reads.
+* @param ctx - context whose LLM registry the model picker reads.
+* @param settings - deployment settings carrying the CLI path and optional override.
 * @returns the disposer that removes the route.
 */
-function registerCodeBuddyCatalog(ctx) {
-	const adapter = new CodeBuddyCatalog(ctx.codebuddySettings);
+function registerCodeBuddyCatalog(ctx, settings) {
+	const adapter = new CodeBuddyCatalog(ctx, settings);
 	const registered = ctx.llm.registerAdapter([CODEBUDDY_PROVIDER], adapter);
 	const directory = ctx.llm.registerConfigurableProviders([{
 		provider: CODEBUDDY_PROVIDER,
@@ -73,11 +218,25 @@ function registerCodeBuddyCatalog(ctx) {
 		registered();
 	};
 }
-/** Catalog row for the CLI driver. `stream` fails closed so a DeepSeek loop cannot impersonate the CLI. */
+/**
+* Catalog row for the CLI driver. `stream` fails closed so a DeepSeek loop
+* cannot impersonate the CLI.
+*
+* The advertised set is the synthetic {@link DEFAULT_MODEL_ID} entry followed by
+* what the CLI accepts: an explicit `models` list from settings when present,
+* otherwise the ids the CLI prints in its own `--model` help.
+*
+* The default entry comes first because a picker that has no saved selection
+* shows the first row, and a session that passes no `--model` is exactly what
+* selecting it means. Its description names the model the CLI will actually
+* run, read from the CLI's own settings file.
+*/
 var CodeBuddyCatalog = class extends LlmAdapter {
+	ctx;
 	settings;
-	constructor(settings) {
+	constructor(ctx, settings) {
 		super();
+		this.ctx = ctx;
 		this.settings = settings;
 	}
 	providerInfo(provider) {
@@ -86,119 +245,52 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 			name: "CodeBuddy"
 		};
 	}
-	listModels(provider) {
-		const configured = this.settings.config.model;
-		const id = configured === "" ? CLI_DEFAULT_MODEL : configured;
-		return Promise.resolve([{
+	async listModels(provider) {
+		const catalog = await this.catalog();
+		const real = catalog.models.filter((id) => id !== DEFAULT_MODEL_ID);
+		const configured = catalog.configured;
+		return [{
 			provider,
-			id,
-			name: id,
+			id: DEFAULT_MODEL_ID,
+			name: "Default",
+			description: configured === "" ? "Uses the model configured in the CodeBuddy CLI" : `Uses the CodeBuddy CLI's configured model: ${configured}`,
 			inputModalities: ["text"],
 			badge: {
 				text: {
-					en: "New session",
-					zh: "新会话"
+					en: "CLI default",
+					zh: "CLI 默认"
 				},
-				tone: "warning"
+				tone: "info"
 			}
-		}]);
+		}, ...real.map((id) => ({
+			provider,
+			id,
+			name: id,
+			...id === configured ? { description: "Currently the configured default in the CodeBuddy CLI" } : {},
+			inputModalities: ["text"]
+		}))];
 	}
 	async *stream() {
 		throw new LlmError("provider \"codebuddy\" is served by the CLI session driver; this adapter only advertises the route", "CODEBUDDY_DRIVER");
 	}
-};
-//#endregion
-//#region lib/types/approval-copy.js
-/**
-* Localized approval copy and operation detail for one CLI permission request.
-* The CLI's own input stays verbatim in every language.
-* @module @deepseek-ai/dsh-agent-codebuddy/approval-copy
-*/
-const copies = {
-	en: {
-		asks: (toolName) => `CodeBuddy CLI asks to use ${toolName}`,
-		withDetail: (toolName, detail) => `CodeBuddy CLI asks to use ${toolName}: ${detail}`
-	},
-	zh: {
-		asks: (toolName) => `CodeBuddy CLI 请求使用 ${toolName}`,
-		withDetail: (toolName, detail) => `CodeBuddy CLI 请求使用 ${toolName}：${detail}`
-	},
-	ja: {
-		asks: (toolName) => `CodeBuddy CLI が ${toolName} の使用を求めています`,
-		withDetail: (toolName, detail) => `CodeBuddy CLI が ${toolName} の使用を求めています：${detail}`
-	},
-	es: {
-		asks: (toolName) => `El CLI de CodeBuddy pide usar ${toolName}`,
-		withDetail: (toolName, detail) => `El CLI de CodeBuddy pide usar ${toolName}: ${detail}`
-	},
-	fr: {
-		asks: (toolName) => `Le CLI CodeBuddy demande à utiliser ${toolName}`,
-		withDetail: (toolName, detail) => `Le CLI CodeBuddy demande à utiliser ${toolName} : ${detail}`
-	},
-	de: {
-		asks: (toolName) => `Die CodeBuddy-CLI möchte ${toolName} verwenden`,
-		withDetail: (toolName, detail) => `Die CodeBuddy-CLI möchte ${toolName} verwenden: ${detail}`
-	},
-	ru: {
-		asks: (toolName) => `CLI CodeBuddy запрашивает использование ${toolName}`,
-		withDetail: (toolName, detail) => `CLI CodeBuddy запрашивает использование ${toolName}: ${detail}`
-	},
-	pt: {
-		asks: (toolName) => `A CLI do CodeBuddy pede para usar ${toolName}`,
-		withDetail: (toolName, detail) => `A CLI do CodeBuddy pede para usar ${toolName}: ${detail}`
+	/** Resolved catalog, honoring an explicit settings list over discovery. */
+	async catalog() {
+		const configured = this.settings.config.models;
+		if (configured.length > 0) {
+			const fallback = this.settings.config.model;
+			return {
+				models: configured,
+				configured: fallback === "" ? configured[0] ?? "" : fallback
+			};
+		}
+		return discoverModels(this.ctx, {
+			command: this.settings.config.command,
+			args: this.settings.config.args,
+			settingsPath: this.settings.config.cliSettingsPath,
+			timeoutMs: this.settings.config.modelsTimeoutMs
+		});
 	}
 };
-/** Input fields that name the operation a human has to judge; the first present field wins. */
-const DETAIL_FIELDS = [
-	"command",
-	"file_path",
-	"path",
-	"pattern",
-	"url"
-];
-/**
-* Pick the operation a human needs to read from the CLI's own tool input.
-* @param input - the `input` object of a `can_use_tool` request.
-* @returns the command, path, or pattern, or `undefined` when the input names none.
-*/
-function permissionDetail(input) {
-	if (input === null || typeof input !== "object") return void 0;
-	const fields = input;
-	for (const key of DETAIL_FIELDS) {
-		const value = fields[key];
-		if (typeof value === "string" && value.trim() !== "") return value;
-	}
-}
-/**
-* Build the approval card's question text so the operation is visible before a
-* decision. Approving a tool name alone hides what will run.
-* @param toolName - tool the CLI wants to use.
-* @param detail - command, path, or pattern taken from the CLI's request.
-* @returns the sentence per supported UI locale, English included.
-*/
-function approvalDisplayReason(toolName, detail) {
-	const render = (copy) => detail === void 0 ? copy.asks(toolName) : copy.withDetail(toolName, detail);
-	return {
-		en: render(copies.en),
-		zh: render(copies.zh),
-		ja: render(copies.ja),
-		es: render(copies.es),
-		fr: render(copies.fr),
-		de: render(copies.de),
-		ru: render(copies.ru),
-		pt: render(copies.pt)
-	};
-}
-/**
-* Durable audit sentence for `approval/asked`. It names the tool only: CLI
-* input can carry credentials, and the audit pair outlives this turn in the
-* session log, while {@link approvalDisplayReason} stays presentation-only.
-* @param toolName - tool the CLI wants to use.
-* @returns the English sentence stored with the audit event.
-*/
-function approvalAuditReason(toolName) {
-	return copies.en.asks(toolName);
-}
 //#endregion
 //#region lib/types/bridge.js
 /**
@@ -284,8 +376,11 @@ const IGNORED = new Set([
 ]);
 /**
 * CLI arguments for one query. No system prompt and no DSH tool whitelist.
-* `--permission-mode` stays `default`. `--setting-sources` is omitted so the
-* installed CLI keeps its own login and settings.
+*
+* `--permission-mode` is always `bypassPermissions`: the driver never answers a
+* permission question, so the CLI must not ask one. A mode that asks would leave
+* every gated tool denied, which reads to a user as a silently dropped turn.
+* `--setting-sources` is omitted so the installed CLI keeps its own login and settings.
 * @param input - resume id, optional explicit model, and partial-message flag.
 * @returns argv after the executable.
 */
@@ -295,7 +390,7 @@ function launchArgs(input) {
 		"--output-format=stream-json",
 		"--verbose",
 		"--permission-mode",
-		"default"
+		"bypassPermissions"
 	];
 	if (input.partial) args.push("--include-partial-messages");
 	if (input.model !== void 0 && input.model !== "") args.push("--model", input.model);
@@ -808,7 +903,7 @@ async function runCliTurn(input) {
 			else if (event.kind === "assistant") {
 				const text = event.blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
 				if (text !== "") committed.push(text);
-				finishLive(appendAssistant(session, input.turn, step, event.blocks, usage));
+				finishLive(appendAssistant(session, input.turn, step, event.blocks, usage, input.recordModel));
 				step += 1;
 			} else if (event.kind === "tool-call") session.append("tool/call", {
 				turn: input.turn,
@@ -936,7 +1031,7 @@ function abortedCause(signal) {
 		default: return { kind: "user" };
 	}
 }
-function appendAssistant(session, turn, step, blocks, usage) {
+function appendAssistant(session, turn, step, blocks, usage, model) {
 	const content = blocks.map((block) => block.type === "text" ? {
 		type: "text",
 		text: block.text
@@ -952,7 +1047,7 @@ function appendAssistant(session, turn, step, blocks, usage) {
 			content,
 			source: {
 				provider: CODEBUDDY_PROVIDER,
-				model: CLI_DEFAULT_MODEL
+				model
 			}
 		}),
 		stream: text.length === 0 ? [] : [{
@@ -978,20 +1073,14 @@ async function answerControl(input, query, message, turn, step) {
 	const body = request !== null && typeof request === "object" ? request : {};
 	const subtype = typeof body.subtype === "string" ? body.subtype : "";
 	if (subtype === "can_use_tool") {
-		const toolName = typeof body.tool_name === "string" ? body.tool_name : "tool";
-		const outcome = await ask(input.ctx, input.agent, toolName, permissionDetail(body.input), input.signal);
 		query.send({
 			type: "control_response",
 			response: {
 				subtype: "success",
 				request_id: requestId,
-				response: outcome === "allowed-once" ? {
+				response: {
 					allowed: true,
 					updatedInput: body.input ?? {},
-					tool_use_id: body.tool_use_id
-				} : {
-					allowed: false,
-					reason: outcome,
 					tool_use_id: body.tool_use_id
 				}
 			}
@@ -1060,18 +1149,6 @@ async function answerControl(input, query, message, turn, step) {
 		}
 	});
 }
-async function ask(ctx, agent, toolName, detail, signal) {
-	const approval = ctx.get("approval");
-	if (approval === void 0) return "unavailable";
-	const displayReason = approvalDisplayReason(toolName, detail);
-	return await approval.request({
-		agent,
-		toolName,
-		reason: approvalAuditReason(toolName),
-		displayReason,
-		signal
-	});
-}
 function abortError() {
 	return /* @__PURE__ */ new Error("codebuddy turn aborted");
 }
@@ -1134,6 +1211,7 @@ var CodeBuddyAgent = class {
 	host;
 	presetHint;
 	launch;
+	readSelection;
 	get id() {
 		return this.session.id;
 	}
@@ -1149,10 +1227,14 @@ var CodeBuddyAgent = class {
 	dispatch;
 	/** CLI session id remembered for the next `--resume`, when one exists. */
 	binding;
-	constructor(host, session, options, presetHint, binding, launch) {
+	constructor(host, session, options, presetHint, binding, launch, readSelection = () => ({
+		lastUsed: null,
+		pending: null
+	})) {
 		this.host = host;
 		this.presetHint = presetHint;
 		this.launch = launch;
+		this.readSelection = readSelection;
 		this.options = options;
 		this.session = session;
 		this.binding = binding;
@@ -1160,10 +1242,10 @@ var CodeBuddyAgent = class {
 		const scope = createScope(host, this);
 		this.ctx = scope.ctx;
 		this.dispatch = agentEvents(host, this);
-		this.model = new AgentModel(() => this.selection(), session, options);
+		this.model = new AgentModel(this.readSelection, session, options);
 		this.session.append("model/selection", {
 			provider: CODEBUDDY_PROVIDER,
-			model: launch.model === void 0 || launch.model === "" ? CLI_DEFAULT_MODEL : launch.model
+			model: this.modelId()
 		});
 	}
 	get status() {
@@ -1211,14 +1293,30 @@ var CodeBuddyAgent = class {
 	inject(message) {
 		this.send(message, "next-step", false);
 	}
-	selection() {
-		return {
-			lastUsed: null,
-			pending: {
-				provider: CODEBUDDY_PROVIDER,
-				model: CLI_DEFAULT_MODEL
-			}
-		};
+	/**
+	* Model this agent reports for the current selection.
+	*
+	* The live selection wins. Selecting {@link DEFAULT_MODEL_ID}, or having no
+	* selection at all, reports that id: the harness record must name something,
+	* and the CLI resolves the concrete model itself.
+	* @returns the model id to record and display.
+	*/
+	modelId() {
+		return this.cliModel() === "" ? DEFAULT_MODEL_ID : this.cliModel();
+	}
+	/**
+	* The `--model` value for the next CLI process.
+	*
+	* An empty string means "send no flag", which is how the CLI's own configured
+	* model takes effect. {@link DEFAULT_MODEL_ID} is a synthetic selection that
+	* maps to that empty string; it is never passed as an argument.
+	* @returns the model id to pass, or an empty string to omit the flag.
+	*/
+	cliModel() {
+		const chosen = this.model.current()?.model ?? "";
+		if (chosen !== "" && chosen !== "default") return chosen;
+		if (this.launch.model !== void 0 && this.launch.model !== "" && this.launch.model !== "default") return this.launch.model;
+		return "";
 	}
 	wake() {
 		if (this.phase === "running") return;
@@ -1263,6 +1361,7 @@ var CodeBuddyAgent = class {
 			this.active = controller;
 			try {
 				const creator = this.currentPreset() === CREATOR_PRESET;
+				const model = this.cliModel();
 				await runCliTurn({
 					ctx: this.host,
 					agent: this,
@@ -1273,7 +1372,8 @@ var CodeBuddyAgent = class {
 					command: this.launch.command,
 					args: this.launch.args,
 					cwd: this.session.header.cwd ?? process.cwd(),
-					...this.launch.model !== void 0 && this.launch.model !== "" ? { model: this.launch.model } : {},
+					...model !== "" ? { model } : {},
+					recordModel: this.modelId(),
 					...this.binding?.cliSessionId !== void 0 ? { resume: this.binding.cliSessionId } : {},
 					graceMs: this.launch.graceMs,
 					signal: controller.signal,
@@ -1375,10 +1475,23 @@ var CodeBuddyLoop = class extends AgentLoop {
 	/** Plain holder so a traced createAgent call still sees the injected services. */
 	locals;
 	bindings = /* @__PURE__ */ new Map();
+	/**
+	* This loop's own handle on the model-selection projection.
+	*
+	* `AgentLoop` registers the same definition, and the registry shares one
+	* registration between both holders, so re-registering here yields a reader
+	* for the Session state the stock loop already folds. The CodeBuddy agent
+	* reads it every turn instead of freezing a model at creation.
+	*/
+	modelProjection;
 	constructor(ctx, config) {
 		super(ctx, config);
 		this.locals = { ctx };
-		ctx.effect(() => registerCodeBuddyCatalog(ctx));
+		ctx.effect(() => registerCodeBuddyCatalog(ctx, ctx.codebuddySettings));
+	}
+	async [Service.init]() {
+		await super[Service.init]();
+		this.modelProjection = await this.locals.ctx.sessionProjections.register(modelSelectionProjectionDefinition);
 	}
 	get settings() {
 		return this.locals.ctx.codebuddySettings.config;
@@ -1412,7 +1525,7 @@ var CodeBuddyLoop = class extends AgentLoop {
 		const agent = new CodeBuddyAgent(host, session, {
 			...agentOptions,
 			provider: CODEBUDDY_PROVIDER,
-			model: this.settings.model || agentOptions.model || "cli-default"
+			model: this.settings.model || agentOptions.model || "default"
 		}, meta?.agentPreset ?? (remembered?.creator ? "cordis" : void 0), remembered, {
 			command,
 			args: this.settings.args,
@@ -1422,7 +1535,7 @@ var CodeBuddyLoop = class extends AgentLoop {
 				this.bindings.set(id, binding);
 				await writeBindings(this.settings.stateDir, this.bindings);
 			}
-		});
+		}, this.modelProjection.readerFor(session));
 		const dispose = host.agents.register(agent);
 		return {
 			agent,

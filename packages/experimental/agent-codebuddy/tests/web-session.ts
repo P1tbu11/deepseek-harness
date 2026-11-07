@@ -3,7 +3,7 @@
  * share one app-boot module. Vitest path mapping would split that module and
  * make profile saves miss the root Include entry.
  */
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -60,10 +60,10 @@ try {
   const selected = await ctx.sessionController.selectModel({
     sessionId: created.sessionId,
     provider: 'codebuddy',
-    model: 'cli-default',
+    model: 'claude-sonnet-5',
   })
   assert.equal(selected.selected.provider, 'codebuddy')
-  assert.equal(selected.selected.model, 'cli-default')
+  assert.equal(selected.selected.model, 'claude-sonnet-5')
   await ctx.agentDefaultModel.saveSelection({ provider: selected.selected.provider, model: selected.selected.model })
   assert.equal(ctx.agentDefaultModel.currentSelection().provider, 'codebuddy')
   await prompt(agent, 'still this session')
@@ -82,7 +82,9 @@ try {
 
   // The Web workspace picker passes a directory that is not the server's own
   // working directory; attaching must still succeed on the chosen path.
-  const chosen = await mkdtemp(join(tmpdir(), 'codebuddy-web-chosen-'))
+  // `mkdtemp` returns the `/var/...` spelling, while the registry canonicalizes
+  // through `fs.realpath` to `/private/var/...` on macOS, so compare canonical forms.
+  const chosen = await realpath(await mkdtemp(join(tmpdir(), 'codebuddy-web-chosen-')))
   try {
     assert.notEqual(resolve(chosen), process.cwd())
     const workspace = await ctx.workspaceRegistry.create(chosen, 'Chosen workspace')

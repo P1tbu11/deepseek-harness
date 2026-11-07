@@ -10,6 +10,9 @@
         command: /absolute/path/to/codebuddy
         probe: false
         model: ''
+        models: []
+        cliSettingsPath: /absolute/path/to/.codebuddy/settings.json
+        modelsTimeoutMs: 8000
         stateDir: /absolute/path/to/codebuddy-state
     - id: agent-codebuddy
       name: '@deepseek-ai/dsh-agent-codebuddy'

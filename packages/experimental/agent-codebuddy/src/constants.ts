@@ -10,5 +10,14 @@ export const BRIDGE_SERVER = 'dsh'
 /** Tool the creator-mode bridge exposes. Native CLI tools are not in this list. */
 export const BRIDGE_TOOL = 'plugin_manager'
 
-/** Display model recorded when the CLI keeps its own model selection. */
-export const CLI_DEFAULT_MODEL = 'cli-default'
+/**
+ * Synthetic model id meaning "let the CLI pick".
+ *
+ * The provider advertises it first so a fresh session has an explicit choice
+ * that round-trips to "pass no `--model`". The CLI then resolves the model from
+ * its own settings, which is why selecting it must never send a real id.
+ *
+ * No CodeBuddy build lists this id, and discovery drops it if one ever does, so
+ * a picker cannot end up with two entries carrying the same id.
+ */
+export const DEFAULT_MODEL_ID = 'default'

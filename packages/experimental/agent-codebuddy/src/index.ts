@@ -1,10 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
+import { Service } from '@deepseek-ai/cordis'
 import type { AgentHandle, AgentOptions, CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
+import { modelSelectionProjectionDefinition, type ModelSelectionProjectionState } from '@deepseek-ai/dsh-agent'
 import AgentLoop, { type Config as LoopConfig } from '@deepseek-ai/dsh-agent-loop'
+import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { readBindings, writeBindings, type CliBinding } from './bindings.ts'
 import { registerCodeBuddyCatalog } from './catalog.ts'
-import { CLI_DEFAULT_MODEL, CODEBUDDY_PROVIDER, CREATOR_PRESET } from './constants.ts'
+import { CODEBUDDY_PROVIDER, CREATOR_PRESET, DEFAULT_MODEL_ID } from './constants.ts'
 import { CodeBuddyAgent } from './driver.ts'
 import { resolveCliPath } from './probe.ts'
 import type CodeBuddySettingsService from './settings.ts'
@@ -27,11 +30,25 @@ export default class CodeBuddyLoop extends AgentLoop {
   /** Plain holder so a traced createAgent call still sees the injected services. */
   private readonly locals: { ctx: Context }
   private bindings = new Map<string, CliBinding>()
+  /**
+   * This loop's own handle on the model-selection projection.
+   *
+   * `AgentLoop` registers the same definition, and the registry shares one
+   * registration between both holders, so re-registering here yields a reader
+   * for the Session state the stock loop already folds. The CodeBuddy agent
+   * reads it every turn instead of freezing a model at creation.
+   */
+  private modelProjection!: ProjectionHandle<ModelSelectionProjectionState>
 
   constructor(ctx: Context, config: CodeBuddyFactoryConfig) {
     super(ctx, config)
     this.locals = { ctx }
-    ctx.effect(() => registerCodeBuddyCatalog(ctx))
+    ctx.effect(() => registerCodeBuddyCatalog(ctx, ctx.codebuddySettings))
+  }
+
+  protected override async [Service.init](): Promise<void> {
+    await super[Service.init]()
+    this.modelProjection = await this.locals.ctx.sessionProjections.register(modelSelectionProjectionDefinition)
   }
 
   private get settings(): CodeBuddySettingsService['config'] {
@@ -76,7 +93,7 @@ export default class CodeBuddyLoop extends AgentLoop {
     const agent = new CodeBuddyAgent(host, session, {
       ...agentOptions,
       provider: CODEBUDDY_PROVIDER,
-      model: this.settings.model || agentOptions.model || CLI_DEFAULT_MODEL,
+      model: this.settings.model || agentOptions.model || DEFAULT_MODEL_ID,
     }, meta?.agentPreset ?? (remembered?.creator ? CREATOR_PRESET : undefined), remembered, {
       command,
       args: this.settings.args,
@@ -86,7 +103,7 @@ export default class CodeBuddyLoop extends AgentLoop {
         this.bindings.set(id, binding)
         await writeBindings(this.settings.stateDir, this.bindings)
       },
-    })
+    }, this.modelProjection.readerFor(session))
     const dispose = host.agents.register(agent)
     return {
       agent,

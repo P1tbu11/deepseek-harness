@@ -14,6 +14,9 @@ export default class CodeBuddySettingsService extends Service {
         probeTimeoutMs: z.number().min(1).default(1500),
         probe: z.boolean().default(true),
         model: z.string().default(''),
+        models: z.array(z.string()).default([]),
+        cliSettingsPath: z.string().default(''),
+        modelsTimeoutMs: z.number().min(100).default(8000),
         stateDir: z.string().default(''),
         graceMs: z.number().min(1).default(3000),
     });

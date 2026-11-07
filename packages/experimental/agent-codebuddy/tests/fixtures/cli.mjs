@@ -9,7 +9,12 @@ import { createInterface } from 'node:readline'
 import { appendFileSync, writeFileSync } from 'node:fs'
 
 const scenario = process.env.CODEBUDDY_FIXTURE ?? 'chat'
-if (process.env.CODEBUDDY_ARGV_LOG) appendFileSync(process.env.CODEBUDDY_ARGV_LOG, `${JSON.stringify(process.argv)}\n`)
+const help = process.argv.includes('--help')
+// A `--help` run is catalog discovery, not a session launch; the argv log holds
+// launches only, so tests can assert what the driver actually spawned.
+if (!help && process.env.CODEBUDDY_ARGV_LOG) {
+  appendFileSync(process.env.CODEBUDDY_ARGV_LOG, `${JSON.stringify(process.argv)}\n`)
+}
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
 const pending = []
 let resume = ''
@@ -23,6 +28,19 @@ function send(value) {
 
 function sessionId() {
   return resume || 'cli-sess-1'
+}
+
+// `<cli> --help` is the only place the CLI lists the models it accepts. Answer
+// it the way the real binary does so discovery runs without a live CLI.
+if (help) {
+  process.stdout.write([
+    'Usage: codebuddy|cbc [options] [command] [prompt]',
+    '',
+    'Options:',
+    '  --model <model>                                  Model for the current session. Please provide the model ID. Currently supported: (claude-sonnet-5, gemini-3.1-pro, deepseek-v4.1-flash, echo)',
+    '',
+  ].join('\n'))
+  process.exit(0)
 }
 
 async function nextLine() {

@@ -1,5 +1,10 @@
 # Overlay for a profile that already stacks dsh-base (and dsh-web-app for the UI).
 # Set enabled and command to the absolute path of the installed CodeBuddy CLI.
+#
+# The model picker lists what this CLI accepts: the ids it prints in its own
+# `--model` help, or the `models` list below when that is non-empty. Leave
+# `cliSettingsPath` pointing at the CLI's settings.json so the picker can label
+# the model a session uses when no model is selected.
 - id: agent-loop
   disabled: true
 - insert:
@@ -10,6 +15,9 @@
         command: /absolute/path/to/codebuddy
         probe: false
         model: ''
+        models: []
+        cliSettingsPath: /absolute/path/to/.codebuddy/settings.json
+        modelsTimeoutMs: 8000
         stateDir: /absolute/path/to/codebuddy-state
     - id: agent-codebuddy
       name: '@deepseek-ai/dsh-agent-codebuddy'

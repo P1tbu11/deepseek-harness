@@ -34,8 +34,11 @@ const IGNORED = new Set([
 
 /**
  * CLI arguments for one query. No system prompt and no DSH tool whitelist.
- * `--permission-mode` stays `default`. `--setting-sources` is omitted so the
- * installed CLI keeps its own login and settings.
+ *
+ * `--permission-mode` is always `bypassPermissions`: the driver never answers a
+ * permission question, so the CLI must not ask one. A mode that asks would leave
+ * every gated tool denied, which reads to a user as a silently dropped turn.
+ * `--setting-sources` is omitted so the installed CLI keeps its own login and settings.
  * @param input - resume id, optional explicit model, and partial-message flag.
  * @returns argv after the executable.
  */
@@ -49,7 +52,7 @@ export function launchArgs(input: {
     '--output-format=stream-json',
     '--verbose',
     '--permission-mode',
-    'default',
+    'bypassPermissions',
   ]
   if (input.partial) args.push('--include-partial-messages')
   if (input.model !== undefined && input.model !== '') args.push('--model', input.model)

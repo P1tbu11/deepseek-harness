@@ -12,8 +12,14 @@ export interface CodeBuddySettings {
   readonly probeTimeoutMs: number
   /** When false, an empty command fails instead of probing. */
   readonly probe: boolean
-  /** Optional CLI `--model`. Empty leaves the CLI's own model. */
+  /** Optional CLI `--model`. Empty follows the live selection or the CLI's own model. */
   readonly model: string
+  /** Explicit model list for the picker. Empty discovers the ids the CLI advertises. */
+  readonly models: readonly string[]
+  /** Absolute path to the CLI's `settings.json`, read for its configured default model. */
+  readonly cliSettingsPath: string
+  /** Deadline for the `--help` discovery run. */
+  readonly modelsTimeoutMs: number
   /** Directory for the CLI session map. Empty keeps the map in memory only. */
   readonly stateDir: string
   /** SIGTERM grace before the subprocess service escalates. */
@@ -33,6 +39,9 @@ export default class CodeBuddySettingsService extends Service {
     probeTimeoutMs: z<number, number, 'defined'>
     probe: z<boolean, boolean, 'defined'>
     model: z<string, string, 'defined'>
+    models: z<string[], string[], 'defined'>
+    cliSettingsPath: z<string, string, 'defined'>
+    modelsTimeoutMs: z<number, number, 'defined'>
     stateDir: z<string, string, 'defined'>
     graceMs: z<number, number, 'defined'>
   }>>, Schemastery.ObjectT<NoInfer<{
@@ -42,6 +51,9 @@ export default class CodeBuddySettingsService extends Service {
     probeTimeoutMs: z<number, number, 'defined'>
     probe: z<boolean, boolean, 'defined'>
     model: z<string, string, 'defined'>
+    models: z<string[], string[], 'defined'>
+    cliSettingsPath: z<string, string, 'defined'>
+    modelsTimeoutMs: z<number, number, 'defined'>
     stateDir: z<string, string, 'defined'>
     graceMs: z<number, number, 'defined'>
   }>>, 'plain'>
