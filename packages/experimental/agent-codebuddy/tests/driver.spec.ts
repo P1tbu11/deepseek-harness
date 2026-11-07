@@ -339,7 +339,9 @@ describe('DeepSeek sessions and profile shape', () => {
     // falls back to the built-in snapshot. The synthetic default leads either way.
     const models = await started.ctx.llm.listModels('codebuddy')
     expect(models.length).toBeGreaterThan(1)
-    expect(models[0]).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text'] })
+    expect(models[0]).toMatchObject({
+      provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text', 'image'],
+    })
   })
 
   it('resolves every advertised model so a picker selection can commit', async () => {
@@ -359,7 +361,7 @@ describe('DeepSeek sessions and profile shape', () => {
   it('labels the synthetic default from the catalog rather than echoing the id', async () => {
     const { ctx } = await bootCodeBuddy('chat')
     const info = await ctx.llm.resolveModelInfo('codebuddy', 'default')
-    expect(info).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text'] })
+    expect(info).toMatchObject({ provider: 'codebuddy', id: 'default', name: 'Default', inputModalities: ['text', 'image'] })
     expect(info.description).toContain('CodeBuddy CLI')
   })
 
@@ -369,8 +371,7 @@ describe('DeepSeek sessions and profile shape', () => {
       .rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
   })
 
-  it('appends the claimed inbox message so the client retires its own row', async () => {
-    const { agent } = await bootCodeBuddy('chat')
+  it('appends the claimed inbox message so the client retires its own row', async () => {    const { agent } = await bootCodeBuddy('chat')
     const sent = createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } })
     agent.followup(sent)
     await agent.whenIdle()

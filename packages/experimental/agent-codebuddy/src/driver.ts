@@ -4,6 +4,9 @@ import { agentEvents, type AgentEventDispatch } from '@deepseek-ai/dsh-agent'
 import { AgentModel } from '@deepseek-ai/dsh-agent'
 import type { ModelSelectionProjectionState } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import type {
   AgentCancelCause, Session, UserMessage,
 } from '@deepseek-ai/dsh-session'
@@ -20,18 +23,87 @@ import {
 } from './protocol.ts'
 import { startQuery, type CliQuery } from './transport.ts'
 
+/** Directory, relative to the session cwd, where attached images are staged. */
+export const IMAGE_STAGE_DIR = '.dsh-attachments'
+
 /**
- * Text sent to the CLI. Non-text blocks refuse the turn before any process starts.
+ * Name one attached image in the prompt through a link beside the session.
+ *
+ * The CLI ships `ViewImage`, a local tool that reads a path the model is told
+ * about; a probe against build 2.181.0 showed the model calls it reliably when
+ * the prompt names the file, and that it follows a symlink whose target lies
+ * outside the session directory. That is the CLI's own design, and it keeps
+ * image bytes out of the conversation history: a path costs the same tokens on
+ * every later turn, while the bytes are read once by the tool instead of
+ * re-sent with each request.
+ *
+ * The attachment store names its objects by sha256 with no extension, and
+ * `ViewImage` refuses a path without one. A link carrying the media type's
+ * extension satisfies both sides without a second copy of the bytes: the store
+ * stays the only place an image is written.
+ *
+ * The bytes behind that link are already the size the model should see. The
+ * attachment provider normalizes on upload — a 2048² pixel budget, a 4 MiB
+ * encoded target, and a 85/75/60 quality ladder that picks WebP when the source
+ * carries alpha and JPEG otherwise, all keyed off a signature-detected format.
+ * `imageHostPath()` returns that normalized object, so resizing or re-encoding
+ * here would only add a second lossy generation and a native image dependency
+ * for work already done upstream.
+ * @param message - the user message taken from the inbox.
+ * @param input - session cwd, the attachment resolver, and the link creator.
+ * @returns the prompt text, with one `[image: …]` line per attached image.
+ */
+export function promptContent(
+  message: UserMessage,
+  input: {
+    readonly cwd: string
+    readonly hostPath: (ref: ImageAttachmentRef) => string | undefined
+    readonly link?: (target: string, path: string) => void
+  },
+): string {
+  const blocks: readonly ContentBlock[] = message.content
+  const text = blocks.map(block => block.type === 'text' ? block.text : '').filter(part => part !== '').join('\n')
+  const images = blocks.filter(block => block.type === 'image')
+  if (images.length === 0) return text
+  const stage = join(input.cwd, IMAGE_STAGE_DIR)
+  mkdirSync(stage, { recursive: true })
+  const lines: string[] = []
+  for (const [index, image] of images.entries()) {
+    const source = input.hostPath(image.attachment)
+    if (source === undefined) {
+      throw new Error(
+        `UNSUPPORTED_INPUT: CodeBuddy cannot read image ${image.attachment.attachmentId}; it has no readable file on this host`,
+      )
+    }
+    const extension = image.attachment.mediaType.split('/')[1] ?? 'png'
+    // Name the link after the stored object, so the same image reached twice
+    // in one session maps to one link instead of a new name per message.
+    const base = basename(source) === '' ? `${message.id}-${index + 1}` : basename(source)
+    const name = `${base}.${extension}`
+    const path = join(stage, name)
+    // Overwrite a stale link from an earlier turn; the target never changes for
+    // a content-addressed object, so the replacement is equivalent.
+    rmSync(path, { force: true })
+    if (input.link !== undefined) input.link(source, path)
+    else symlinkSync(source, path)
+    lines.push(`[image: ${IMAGE_STAGE_DIR}/${name}]`)
+  }
+  return [text, ...lines].filter(part => part !== '').join('\n')
+}
+
+/**
+ * Text half of a message. Images are staged as files and named in the text, so
+ * this only joins the text blocks.
  * @param message - the user message taken from the inbox.
  * @returns the joined text blocks.
  */
 export function promptText(message: UserMessage): string {
   const blocks: readonly ContentBlock[] = message.content
-  const foreign = blocks.filter(block => block.type !== 'text').map(block => block.type)
+  const foreign = blocks.filter(block => block.type !== 'text' && block.type !== 'image').map(block => block.type)
   if (foreign.length > 0) {
-    throw new Error(`UNSUPPORTED_INPUT: CodeBuddy prompt keeps text only; refused block types ${foreign.join(',')}`)
+    throw new Error(`UNSUPPORTED_INPUT: CodeBuddy prompt keeps text and images only; refused block types ${foreign.join(',')}`)
   }
-  return blocks.map(block => block.type === 'text' ? block.text : '').join('\n')
+  return blocks.map(block => block.type === 'text' ? block.text : '').filter(part => part !== '').join('\n')
 }
 
 /**
@@ -620,7 +692,11 @@ export class CodeBuddyAgent implements Agent {
       this.inbox.splice(target, 0, 1, [])
       let text: string
       try {
-        text = promptText(message)
+        const attachments = this.host.get('attachments')
+        text = promptContent(message, {
+          cwd: this.session.header.cwd ?? process.cwd(),
+          hostPath: ref => attachments?.imageHostPath(ref),
+        })
       } catch (error: unknown) {
         const messageText = error instanceof Error ? error.message : 'codebuddy turn failed'
         this.session.append('turn/start', { turn: this.turn + 1 })

@@ -68,7 +68,7 @@ class CodeBuddyCatalog extends LlmAdapter {
     id: string
     name: string
     description?: string
-    inputModalities?: readonly ['text']
+    inputModalities?: readonly ['text', ...'image'[]]
   }> {
     const catalog = await this.catalog()
     if (model === DEFAULT_MODEL_ID) {
@@ -80,7 +80,7 @@ class CodeBuddyCatalog extends LlmAdapter {
         description: configured === ''
           ? 'Uses the model configured in the CodeBuddy CLI'
           : `Uses the CodeBuddy CLI's configured model: ${configured}`,
-        inputModalities: ['text'],
+        inputModalities: ['text', 'image'],
       }
     }
     if (!catalog.models.includes(model)) {
@@ -89,7 +89,7 @@ class CodeBuddyCatalog extends LlmAdapter {
         'UNKNOWN_MODEL',
       )
     }
-    return { provider, id: model, name: model, inputModalities: ['text'] }
+    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
   }
 
   override async listModels(provider: string): Promise<readonly {
@@ -97,7 +97,7 @@ class CodeBuddyCatalog extends LlmAdapter {
     id: string
     name: string
     description?: string
-    inputModalities: readonly ['text']
+    inputModalities: readonly ['text', ...'image'[]]
     badge?: { text: { en: string; zh: string }; tone: 'neutral' | 'info' | 'success' | 'warning' }
   }[]> {
     const catalog = await this.catalog()
@@ -113,7 +113,7 @@ class CodeBuddyCatalog extends LlmAdapter {
         description: configured === ''
           ? 'Uses the model configured in the CodeBuddy CLI'
           : `Uses the CodeBuddy CLI's configured model: ${configured}`,
-        inputModalities: ['text'] as const,
+        inputModalities: ['text', 'image'] as const,
         badge: { text: { en: 'CLI default', zh: 'CLI 默认' }, tone: 'info' as const },
       },
       ...real.map(id => ({
@@ -123,7 +123,9 @@ class CodeBuddyCatalog extends LlmAdapter {
         ...id === configured
           ? { description: 'Currently the configured default in the CodeBuddy CLI' }
           : {},
-        inputModalities: ['text'] as const,
+        // The driver sends images inline when the message carries them, so
+        // every route it advertises accepts both.
+        inputModalities: ['text', 'image'] as const,
       })),
     ]
   }
