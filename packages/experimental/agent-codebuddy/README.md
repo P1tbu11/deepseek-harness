@@ -17,6 +17,7 @@ Select this layer on a profile that already stacks `dsh-base`. It disables the s
 - [Output fidelity](#output-fidelity)
 - [Understand the implementation](#understand-the-implementation)
 - [Further Exploration](#further-exploration)
+- [Protocol basis](#protocol-basis)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
 - [Dev Note](#dev-note)
@@ -89,6 +90,23 @@ Creator mode (`agentPreset: cordis`) adds an in-process bridge named `dsh` for t
 
 -----
 
+<a id="protocol-basis"></a>
+## Protocol basis
+
+The fixture is a synthetic peer. It checks the subset this plugin sends and accepts. A passing fixture does not show that a particular CodeBuddy CLI build emitted those frames.
+
+Public CodeBuddy documents used for that subset:
+
+- [Workflow stdio protocol](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) says `cbc` / `codebuddy` stream-json aligns with Claude Code 2.1.220. It specifies NDJSON, `control_request` `initialize` (`hooks`, `capabilities`, `hasPrompt`), a `user` message, and `interrupt`. Stdout includes `system`, `assistant`, `user`, `result`, and `control_response`.
+- [Headless mode](https://www.codebuddy.ai/docs/cli/headless) shows `--input-format=stream-json`, `--output-format=stream-json`, and `--verbose` for a piped user message. Its long-lived control examples add `rewind` and `rewind_files`, which this plugin does not send.
+- [MCP first-run status](https://www.codebuddy.ai/docs/cli/mcp-first-run-status) shows the same flags without `-p`, and a user message whose `content` is a text block array. This plugin sends the string `content` from the workflow example, not that block array.
+- The published CodeBuddy SDK issue [codebuddy-code#121](https://cnb.cool/codebuddy/codebuddy-code/-/issues/121) shows `initialize` carrying `sdkMcpServers` and `capabilities.askUserQuestion` when a permission callback is configured. This plugin sends those fields and does not send `systemPrompt` or `appendSystemPrompt`.
+- `can_use_tool` and `mcp_message` are not listed on the CodeBuddy workflow page. The plugin answers them in the shape of the current Claude Agent SDK control loop: allow is `{ behavior: "allow", updatedInput }`, deny is `{ behavior: "deny", message }`, and an MCP result is `{ mcp_response }`. That is the control subset the workflow page says the channel aligns with, not a captured CodeBuddy CLI log.
+
+`interrupt` here omits the `session_id` the workflow example includes.
+
+-----
+
 <a id="model-experience"></a>
 ## Model Experience
 
@@ -124,12 +142,13 @@ The DeepSeek route is unchanged.
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- The engine is chosen when the session is created or resumed. Changing the model picker afterward does not move a live session between drivers.
+- The engine is chosen when the session is created or resumed. `listProviders` and `listModels` advertise `codebuddy`, and a new session created with that provider uses the CLI. Changing the model picker on a session that already uses the DeepSeek loop does not move it onto the CLI.
 - User messages that contain non-text blocks are refused before the CLI starts.
 - File bodies are not reconstructed from `file-history-snapshot`. A diff appears only when the tool result text or a normal workspace-changes turn snapshot already has it.
 - `query()` is one CLI process per DSH turn. The next turn passes `--resume`. Interrupt acknowledgement is not treated as exit.
 - Visual Web acceptance was not run. Tool rows use the existing `tool/call` cards.
-- A passing fixture test checks the stream-json projection and the creator-mode bridge. It does not show that a real CodeBuddy model or terminal TUI matches this projection byte for byte.
+- A passing fixture checks the stream-json projection and one `plugin_manager` discovery plus call. It does not run `install_bundle`, and it does not exercise plugin-manager UI or hot reload.
+- The projection is not a lossless copy. Non-text user input is refused. Thinking signatures, redacted thinking, and image bytes are not stored. `file-history-snapshot` is not rebuilt into files.
 
 <a id="dev-note"></a>
 ### Dev Note

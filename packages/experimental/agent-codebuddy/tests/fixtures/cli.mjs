@@ -89,7 +89,8 @@ if (scenario === 'chat') {
     request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: prompt }, tool_use_id: 'toolu_perm' },
   })
   const reply = await nextLine()
-  const allowed = reply?.response?.response?.allowed === true
+  const decision = reply?.response?.response
+  const allowed = decision?.behavior === 'allow'
   send({
     type: 'assistant',
     session_id: sessionId(),

@@ -17,6 +17,7 @@ kind: "package-bundle"
 - [输出保真](#output-fidelity)
 - [理解实现](#understand-the-implementation)
 - [进一步探索](#further-exploration)
+- [协议依据](#protocol-basis)
 - [模型体验](#model-experience)
 - [已知限制与暂缓工作](#known-limitations-and-deferred-work)
 - [开发备注](#dev-note)
@@ -89,6 +90,23 @@ pnpm exec vitest run packages/experimental/agent-codebuddy/tests
 
 -----
 
+<a id="protocol-basis"></a>
+## 协议依据
+
+fixture 是合成对端，只检查本插件实际发送和接受的子集。测试通过不表示某个 CodeBuddy CLI 构建发出过这些帧。
+
+该子集引用的公开 CodeBuddy 文档：
+
+- [Workflow stdio 协议](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) 写明 `cbc` / `codebuddy` 的 stream-json 与 Claude Code 2.1.220 对齐。它规定 NDJSON、`control_request` 的 `initialize`（`hooks`、`capabilities`、`hasPrompt`）、`user` 消息和 `interrupt`。stdout 包括 `system`、`assistant`、`user`、`result` 和 `control_response`。
+- [Headless 模式](https://www.codebuddy.ai/docs/cli/headless) 给出 `--input-format=stream-json`、`--output-format=stream-json` 和 `--verbose`，用于管道输入的用户消息。其中的长连接示例还有 `rewind` 与 `rewind_files`，本插件不发送。
+- [MCP 首次运行状态](https://www.codebuddy.ai/docs/cli/mcp-first-run-status) 使用同样的 flag 且不带 `-p`，用户消息的 `content` 是文本块数组。本插件发送的是工作流示例里的字符串 `content`，不是那个块数组。
+- CodeBuddy SDK 的公开问题 [codebuddy-code#121](https://cnb.cool/codebuddy/codebuddy-code/-/issues/121) 显示，配置了权限回调时 `initialize` 会带 `sdkMcpServers` 和 `capabilities.askUserQuestion`。本插件发送这些字段，不发送 `systemPrompt` 或 `appendSystemPrompt`。
+- CodeBuddy 工作流页面没有列出 `can_use_tool` 和 `mcp_message`。本插件按当前 Claude Agent SDK 控制循环的形式回答：允许为 `{ behavior: "allow", updatedInput }`，拒绝为 `{ behavior: "deny", message }`，MCP 结果为 `{ mcp_response }`。这是工作流页面所说对齐的控制子集，不是一份 CodeBuddy CLI 录制。
+
+这里的 `interrupt` 省略了工作流示例中的 `session_id`。
+
+-----
+
 <a id="model-experience"></a>
 ## 模型体验
 
@@ -124,12 +142,13 @@ DeepSeek 路线保持不变。
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- 引擎在会话创建或恢复时决定。之后改模型选择器不会把活会话换到另一个驱动。
+- 引擎在会话创建或恢复时决定。`listProviders` 和 `listModels` 会列出 `codebuddy`，创建时带上这个 provider 的新会话才走 CLI。已经走 DeepSeek loop 的会话，之后改模型选择器不会换到 CLI。
 - 含非文本块的用户消息会在 CLI 启动前被拒绝。
 - `file-history-snapshot` 不会被还原成文件内容。只有工具结果文本或正常的 workspace-changes 回合快照里已经有差异时才会显示。
 - 每个 DSH 回合启动一个 CLI 进程，下一回合使用 `--resume`。interrupt 的确认不算进程已退出。
 - 没有做 Web 视觉验收。工具行使用现有的 `tool/call` 卡片。
-- 通过的 fixture 测试检查的是 stream-json 投影和创造模式桥。它不表示真实 CodeBuddy 模型或终端 TUI 与该投影逐字节一致。
+- 通过的 fixture 检查 stream-json 投影，以及一次 `plugin_manager` 发现和调用。它没有运行 `install_bundle`，也没有验收插件管理界面或热加载。
+- 投影不是无损复制。非文本用户输入会被拒绝。thinking 签名、被遮蔽的 thinking 和图片字节不会存储。`file-history-snapshot` 不会被重建成文件。
 
 <a id="dev-note"></a>
 ### 开发备注

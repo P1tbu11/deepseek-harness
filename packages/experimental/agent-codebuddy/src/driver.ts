@@ -247,8 +247,8 @@ async function answerControl(input: {
         subtype: 'success',
         request_id: requestId,
         response: outcome === 'allowed-once'
-          ? { allowed: true, updatedInput: body.input ?? {} }
-          : { allowed: false, reason: outcome },
+          ? { behavior: 'allow', updatedInput: body.input ?? {} }
+          : { behavior: 'deny', message: outcome },
       },
     })
     return

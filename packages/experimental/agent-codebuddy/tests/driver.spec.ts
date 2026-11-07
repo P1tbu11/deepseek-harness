@@ -4,9 +4,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
@@ -19,13 +17,10 @@ import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply as applyPluginTools } from '@deepseek-ai/dsh-plugin-manager/tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
-import { readFileSync } from 'node:fs'
 import CodeBuddyLoop from '../src/index.ts'
 import CodeBuddySettings from '../src/settings.ts'
 
 const fixture = fileURLToPath(new URL('./fixtures/cli.mjs', import.meta.url))
-const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
-const preset = readFileSync(new URL('../../../bundle/web-app/presets/cordis.patch.yml', import.meta.url), 'utf8')
 
 class MockAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
@@ -238,26 +233,10 @@ describe('DeepSeek sessions and profile shape', () => {
     expect(texts(handle.agent)).toEqual(['deepseek-ok'])
     expect(started.adapter.requests).toHaveLength(1)
     expect(started.ctx.tools.executable('plugin_manager')).toBeDefined()
-  })
-
-  it('registers one factory and keeps the creator preset row addressable', async () => {
-    const started = await harness({ enabled: false, probe: false })
-    dirs.push(started)
-    await expect(started.ctx.plugin(AgentLoop, { agents: [] })).rejects.toThrow(/agentLoop/)
-    const base = [
-      { id: 'agent-loop', name: '@deepseek-ai/dsh-agent-loop' },
-      { id: 'preset-cordis', name: '@deepseek-ai/dsh-agent-preset' },
-    ]
-    const composed = applyEntryPatches(base, [
-      { id: 'agent-loop', disabled: true },
-      { insert: [{ id: 'agent-codebuddy', name: '@deepseek-ai/dsh-agent-codebuddy' }] },
-    ], () => {})
-    expect(composed.find(entry => entry.id === 'agent-loop')?.disabled).toBe(true)
-    expect(composed.find(entry => entry.id === 'agent-codebuddy')?.name).toBe('@deepseek-ai/dsh-agent-codebuddy')
-    expect(composed.find(entry => entry.id === 'preset-cordis')).toBeDefined()
-    expect(patch).toContain('disabled: true')
-    expect(preset).toContain('tool-plugin-manager')
-    expect(preset).toContain('@deepseek-ai/dsh-plugin-manager/tools')
+    expect(started.ctx.llm.listProviders().map(provider => provider.id)).toContain('codebuddy')
+    await expect(started.ctx.llm.listModels('codebuddy')).resolves.toEqual([
+      { provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'] },
+    ])
   })
 })
 

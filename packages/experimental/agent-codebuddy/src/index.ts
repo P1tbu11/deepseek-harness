@@ -3,6 +3,7 @@ import type { AgentHandle, AgentOptions, CreateAgentOptions, ResumeAgentOptions 
 import AgentLoop, { type Config as LoopConfig } from '@deepseek-ai/dsh-agent-loop'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { readBindings, writeBindings, type CliBinding } from './bindings.ts'
+import { registerCodeBuddyCatalog } from './catalog.ts'
 import { CLI_DEFAULT_MODEL, CODEBUDDY_PROVIDER, CREATOR_PRESET } from './constants.ts'
 import { CodeBuddyAgent } from './driver.ts'
 import { resolveCliPath } from './probe.ts'
@@ -30,6 +31,7 @@ export default class CodeBuddyLoop extends AgentLoop {
   constructor(ctx: Context, config: CodeBuddyFactoryConfig) {
     super(ctx, config)
     this.locals = { ctx }
+    ctx.effect(() => registerCodeBuddyCatalog(ctx))
   }
 
   private get settings(): CodeBuddySettingsService['config'] {

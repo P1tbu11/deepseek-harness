@@ -55,7 +55,7 @@ export type Config = z.infer<typeof Config>
 
 - `inject`: `...AgentLoop.inject` · `subprocess` · `codebuddySettings`
 - `refs`: [`LoopConfig`](#deepseek-aidsh-agent-loop)
-- `source`: [`packages/experimental/agent-codebuddy/src/index.ts:16`](../packages/experimental/agent-codebuddy/src/index.ts)
+- `source`: [`packages/experimental/agent-codebuddy/src/index.ts:17`](../packages/experimental/agent-codebuddy/src/index.ts)
 
 ```ts config-catalog
 /**
