@@ -1,0 +1,60 @@
+import { Context, Service } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+/** Deployment settings for the CodeBuddy CLI. DeepSeek sessions ignore them. */
+export interface CodeBuddySettings {
+  /** When false, a codebuddy provider fails instead of probing or spawning. */
+  readonly enabled: boolean
+  /** Absolute CLI path. Empty uses the fixed candidate list after `enabled`. */
+  readonly command: string
+  /** Extra arguments before the stream-json flags. */
+  readonly args: readonly string[]
+  /** Stat timeout for each candidate path. */
+  readonly probeTimeoutMs: number
+  /** When false, an empty command fails instead of probing. */
+  readonly probe: boolean
+  /** Optional CLI `--model`. Empty leaves the CLI's own model. */
+  readonly model: string
+  /** Directory for the CLI session map. Empty keeps the map in memory only. */
+  readonly stateDir: string
+  /** SIGTERM grace before the subprocess service escalates. */
+  readonly graceMs: number
+}
+/**
+ * Config service read by the CodeBuddy factory. Kept separate so the factory
+ * can keep the default agent-loop config schema.
+ */
+export default class CodeBuddySettingsService extends Service {
+  readonly config: CodeBuddySettings
+  static inject: never[]
+  static Config: z<Schemastery.ObjectS<NoInfer<{
+    enabled: z<boolean, boolean, 'defined'>
+    command: z<string, string, 'defined'>
+    args: z<string[], string[], 'defined'>
+    probeTimeoutMs: z<number, number, 'defined'>
+    probe: z<boolean, boolean, 'defined'>
+    model: z<string, string, 'defined'>
+    stateDir: z<string, string, 'defined'>
+    graceMs: z<number, number, 'defined'>
+  }>>, Schemastery.ObjectT<NoInfer<{
+    enabled: z<boolean, boolean, 'defined'>
+    command: z<string, string, 'defined'>
+    args: z<string[], string[], 'defined'>
+    probeTimeoutMs: z<number, number, 'defined'>
+    probe: z<boolean, boolean, 'defined'>
+    model: z<string, string, 'defined'>
+    stateDir: z<string, string, 'defined'>
+    graceMs: z<number, number, 'defined'>
+  }>>, 'plain'>
+    /**
+     * @param ctx - host context that publishes the service.
+     * @param config - validated CLI settings.
+     */
+  constructor(ctx: Context, config: CodeBuddySettings)
+}
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Deployment settings for the CodeBuddy CLI. */
+    codebuddySettings: CodeBuddySettingsService
+  }
+}
+//# sourceMappingURL=settings.d.ts.map

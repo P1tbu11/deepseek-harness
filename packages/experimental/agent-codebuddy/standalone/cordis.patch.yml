@@ -1,0 +1,15 @@
+# Selecting this bundle replaces the stock agent factory. DeepSeek providers
+# still use AgentLoop. CodeBuddy stays off until a later patch sets enabled.
+- id: agent-loop
+  disabled: true
+- insert:
+    - id: agent-codebuddy-settings
+      name: '@deepseek-ai/dsh-agent-codebuddy/settings'
+      config:
+        enabled: false
+        command: ''
+        probe: false
+        model: ''
+        stateDir: ''
+    - id: agent-codebuddy
+      name: '@deepseek-ai/dsh-agent-codebuddy'
