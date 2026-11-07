@@ -5,7 +5,7 @@
  */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
@@ -79,6 +79,23 @@ try {
   const argv = await readFile(argvLog, 'utf8')
   assert.match(argv, /--input-format=stream-json/)
   assert.doesNotMatch(argv, /--system-prompt/)
+
+  // The Web workspace picker passes a directory that is not the server's own
+  // working directory; attaching must still succeed on the chosen path.
+  const chosen = await mkdtemp(join(tmpdir(), 'codebuddy-web-chosen-'))
+  try {
+    assert.notEqual(resolve(chosen), process.cwd())
+    const workspace = await ctx.workspaceRegistry.create(chosen, 'Chosen workspace')
+    const attached = await ctx.sessionController.create({ workspaceId: workspace.id })
+    const attachedAgent = ctx.agents.get(attached.sessionId)
+    assert.ok(attachedAgent)
+    assert.equal(resolve(attachedAgent.session.header.cwd ?? ''), resolve(chosen))
+    assert.ok(workspace.sessionIds.includes(attached.sessionId))
+    await prompt(attachedAgent, 'session in the chosen workspace')
+    assert.ok(texts(attachedAgent).includes('你好'))
+  } finally {
+    await rm(chosen, { recursive: true, force: true })
+  }
   process.stdout.write('web-session: ok\n')
 } finally {
   await ctx.fiber.dispose()
