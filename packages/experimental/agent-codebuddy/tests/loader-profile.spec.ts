@@ -5,6 +5,7 @@
  * Session creation uses `agents.create` with the default-model getters the headless
  * runner and the web session controller both pass through.
  */
+import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -80,7 +81,10 @@ it('loads the delivered profile patch through the shipped headless Loader', asyn
     })
     expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(expect.arrayContaining(['deepseek-official', 'codebuddy']))
     await expect(ctx.llm.listModels('codebuddy')).resolves.toEqual([
-      { provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'] },
+      {
+        provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'],
+        badge: { text: { en: 'New session', zh: '新会话' }, tone: 'warning' },
+      },
     ])
 
     const selection = () => ctx.agentDefaultModel.currentSelection()
@@ -117,6 +121,16 @@ it('loads the delivered profile patch through the shipped headless Loader', asyn
   }
 }, 180_000)
 
+it('runs the web sessionController path in plain Node', () => {
+  const result = spawnSync(process.execPath, ['--experimental-strip-types', fileURLToPath(new URL('./web-session.ts', import.meta.url))], {
+    cwd: fileURLToPath(new URL('../../../../', import.meta.url)),
+    encoding: 'utf8',
+    timeout: 120_000,
+  })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('web-session: ok')
+}, 120_000)
+
 async function prompt(agent: Agent, text: string): Promise<void> {
   agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
   await agent.whenIdle()
@@ -130,7 +144,7 @@ function texts(agent: Agent): string[] {
 }
 
 function reason(agent: Agent): string {
-  const end = agent.session.snapshotEvents().find(event => event.type === 'turn/end')
+  const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
   if (end?.type !== 'turn/end') return ''
   return end.data.reason.kind === 'error' ? end.data.reason.error.message : end.data.reason.kind
 }

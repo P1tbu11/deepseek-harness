@@ -97,11 +97,10 @@ fixture 是合成对端，只检查本插件实际发送和接受的子集。测
 
 该子集引用的公开 CodeBuddy 文档：
 
-- [Workflow stdio 协议](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) 写明 `cbc` / `codebuddy` 的 stream-json 与 Claude Code 2.1.220 对齐。它规定 NDJSON、`control_request` 的 `initialize`（`hooks`、`capabilities`、`hasPrompt`）、`user` 消息和 `interrupt`。stdout 包括 `system`、`assistant`、`user`、`result` 和 `control_response`。
+- [Workflow stdio 协议](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) 写明 `cbc` / `codebuddy` 的 stream-json 与 Claude Code 2.1.220 对齐。这句话不是 subtype 清单。该页规定 NDJSON、`control_request` 的 `initialize`（`hooks`、`capabilities`、`hasPrompt`）、`user` 消息和 `interrupt`。stdout 包括 `system`、`assistant`、`user`、`result` 和 `control_response`。
 - [Headless 模式](https://www.codebuddy.ai/docs/cli/headless) 给出 `--input-format=stream-json`、`--output-format=stream-json` 和 `--verbose`，用于管道输入的用户消息。其中的长连接示例还有 `rewind` 与 `rewind_files`，本插件不发送。
 - [MCP 首次运行状态](https://www.codebuddy.ai/docs/cli/mcp-first-run-status) 使用同样的 flag 且不带 `-p`，用户消息的 `content` 是文本块数组。本插件发送的是工作流示例里的字符串 `content`，不是那个块数组。
-- CodeBuddy SDK 的公开问题 [codebuddy-code#121](https://cnb.cool/codebuddy/codebuddy-code/-/issues/121) 显示，配置了权限回调时 `initialize` 会带 `sdkMcpServers` 和 `capabilities.askUserQuestion`。本插件发送这些字段，不发送 `systemPrompt` 或 `appendSystemPrompt`。
-- CodeBuddy 工作流页面没有列出 `can_use_tool` 和 `mcp_message`。本插件按当前 Claude Agent SDK 控制循环的形式回答：允许为 `{ behavior: "allow", updatedInput }`，拒绝为 `{ behavior: "deny", message }`，MCP 结果为 `{ mcp_response }`。这是工作流页面所说对齐的控制子集，不是一份 CodeBuddy CLI 录制。
+- 已发布的 [@tencent-ai/agent-sdk@0.3.244](https://cdn.jsdelivr.net/npm/@tencent-ai/agent-sdk@0.3.244/package.json)（`lib/version.js` 中的 `SDK_VERSION` 为 `0.3.28`）在 `lib/types.d.ts` 声明了 `ControlInitializeRequest`、`ControlPermissionRequest` 和 `ControlMcpMessageRequest`。`lib/_internal/query-controller.js` 发送的 `initialize` 带 `capabilities.askUserQuestion: true`，并且只在存在进程内服务时带 `sdkMcpServers`。权限回复是 `{ allowed: true, updatedInput, tool_use_id }` 或 `{ allowed: false, reason, tool_use_id }`。`lib/transport/process-transport.js` 用 `{ mcp_response }` 回答 `mcp_message`。本插件跟随这些字段，不发送 `systemPrompt`。该包在运行时从可执行文件解析 CLI 版本，这里没有公布最低 CLI semver。没有执行过 CodeBuddy CLI 二进制。
 
 这里的 `interrupt` 省略了工作流示例中的 `session_id`。
 
@@ -142,12 +141,12 @@ DeepSeek 路线保持不变。
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- 引擎在会话创建或恢复时决定。`listProviders` 和 `listModels` 会列出 `codebuddy`，创建时带上这个 provider 的新会话才走 CLI。已经走 DeepSeek loop 的会话，之后改模型选择器不会换到 CLI。
+- 引擎在会话创建或恢复时决定。模型列表带有“新会话”标记。已经走 DeepSeek loop 的会话里选择 CodeBuddy，不会把这个会话换到 CLI。只有默认 provider 已是 `codebuddy` 时创建的会话才走 CLI。
 - 含非文本块的用户消息会在 CLI 启动前被拒绝。
 - `file-history-snapshot` 不会被还原成文件内容。只有工具结果文本或正常的 workspace-changes 回合快照里已经有差异时才会显示。
 - 每个 DSH 回合启动一个 CLI 进程，下一回合使用 `--resume`。interrupt 的确认不算进程已退出。
 - 没有做 Web 视觉验收。工具行使用现有的 `tool/call` 卡片。
-- 通过的 fixture 检查 stream-json 投影，以及一次 `plugin_manager` 发现和调用。它没有运行 `install_bundle`，也没有验收插件管理界面或热加载。
+- 通过的 fixture 按 `@tencent-ai/agent-sdk@0.3.244` 检查 stream-json 投影，以及一次 `plugin_manager` 发现和调用。它没有运行 CodeBuddy CLI 二进制、`install_bundle`、插件管理界面或热加载。审批仍然失败即拒绝，没有默认放行，也没有权限绕过。
 - 投影不是无损复制。非文本用户输入会被拒绝。thinking 签名、被遮蔽的 thinking 和图片字节不会存储。`file-history-snapshot` 不会被重建成文件。
 
 <a id="dev-note"></a>

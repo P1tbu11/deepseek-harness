@@ -37,7 +37,13 @@ class CodeBuddyCatalog extends LlmAdapter {
   override listModels(provider: string): Promise<readonly { provider: string; id: string; name: string; inputModalities: readonly ['text'] }[]> {
     const configured = this.settings.config.model
     const id = configured === '' ? CLI_DEFAULT_MODEL : configured
-    return Promise.resolve([{ provider, id, name: id, inputModalities: ['text'] }])
+    return Promise.resolve([{
+      provider,
+      id,
+      name: id,
+      inputModalities: ['text'],
+      badge: { text: { en: 'New session', zh: '新会话' }, tone: 'warning' },
+    }])
   }
 
   override async *stream(): AsyncIterable<StreamChunk> {

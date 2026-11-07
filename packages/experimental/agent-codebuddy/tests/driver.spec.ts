@@ -235,7 +235,10 @@ describe('DeepSeek sessions and profile shape', () => {
     expect(started.ctx.tools.executable('plugin_manager')).toBeDefined()
     expect(started.ctx.llm.listProviders().map(provider => provider.id)).toContain('codebuddy')
     await expect(started.ctx.llm.listModels('codebuddy')).resolves.toEqual([
-      { provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'] },
+      {
+        provider: 'codebuddy', id: 'cli-default', name: 'cli-default', inputModalities: ['text'],
+        badge: { text: { en: 'New session', zh: '新会话' }, tone: 'warning' },
+      },
     ])
   })
 })

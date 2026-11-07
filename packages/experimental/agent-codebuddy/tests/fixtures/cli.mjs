@@ -90,7 +90,7 @@ if (scenario === 'chat') {
   })
   const reply = await nextLine()
   const decision = reply?.response?.response
-  const allowed = decision?.behavior === 'allow'
+  const allowed = decision?.allowed === true && decision?.behavior === undefined && decision?.tool_use_id === 'toolu_perm'
   send({
     type: 'assistant',
     session_id: sessionId(),

@@ -97,11 +97,10 @@ The fixture is a synthetic peer. It checks the subset this plugin sends and acce
 
 Public CodeBuddy documents used for that subset:
 
-- [Workflow stdio protocol](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) says `cbc` / `codebuddy` stream-json aligns with Claude Code 2.1.220. It specifies NDJSON, `control_request` `initialize` (`hooks`, `capabilities`, `hasPrompt`), a `user` message, and `interrupt`. Stdout includes `system`, `assistant`, `user`, `result`, and `control_response`.
+- [Workflow stdio protocol](https://www.codebuddy.ai/docs/cli/workflow-stdio-protocol) says `cbc` / `codebuddy` stream-json aligns with Claude Code 2.1.220. That sentence is not a subtype list. The page specifies NDJSON, `control_request` `initialize` (`hooks`, `capabilities`, `hasPrompt`), a `user` message, and `interrupt`. Stdout includes `system`, `assistant`, `user`, `result`, and `control_response`.
 - [Headless mode](https://www.codebuddy.ai/docs/cli/headless) shows `--input-format=stream-json`, `--output-format=stream-json`, and `--verbose` for a piped user message. Its long-lived control examples add `rewind` and `rewind_files`, which this plugin does not send.
 - [MCP first-run status](https://www.codebuddy.ai/docs/cli/mcp-first-run-status) shows the same flags without `-p`, and a user message whose `content` is a text block array. This plugin sends the string `content` from the workflow example, not that block array.
-- The published CodeBuddy SDK issue [codebuddy-code#121](https://cnb.cool/codebuddy/codebuddy-code/-/issues/121) shows `initialize` carrying `sdkMcpServers` and `capabilities.askUserQuestion` when a permission callback is configured. This plugin sends those fields and does not send `systemPrompt` or `appendSystemPrompt`.
-- `can_use_tool` and `mcp_message` are not listed on the CodeBuddy workflow page. The plugin answers them in the shape of the current Claude Agent SDK control loop: allow is `{ behavior: "allow", updatedInput }`, deny is `{ behavior: "deny", message }`, and an MCP result is `{ mcp_response }`. That is the control subset the workflow page says the channel aligns with, not a captured CodeBuddy CLI log.
+- Published package [@tencent-ai/agent-sdk@0.3.244](https://cdn.jsdelivr.net/npm/@tencent-ai/agent-sdk@0.3.244/package.json) (`lib/version.js` reports `SDK_VERSION` `0.3.28`) types `ControlInitializeRequest`, `ControlPermissionRequest`, and `ControlMcpMessageRequest` in `lib/types.d.ts`. `lib/_internal/query-controller.js` sends `initialize` with `capabilities.askUserQuestion: true` and `sdkMcpServers` only when an in-process server exists. Its permission reply is `{ allowed: true, updatedInput, tool_use_id }` or `{ allowed: false, reason, tool_use_id }`. `lib/transport/process-transport.js` answers `mcp_message` with `{ mcp_response }`. This plugin follows those fields. It does not send `systemPrompt`. The package resolves a CLI version from the executable at runtime and does not publish a minimum CLI semver here. No CodeBuddy CLI binary was executed.
 
 `interrupt` here omits the `session_id` the workflow example includes.
 
@@ -142,12 +141,12 @@ The DeepSeek route is unchanged.
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- The engine is chosen when the session is created or resumed. `listProviders` and `listModels` advertise `codebuddy`, and a new session created with that provider uses the CLI. Changing the model picker on a session that already uses the DeepSeek loop does not move it onto the CLI.
+- The engine is chosen when the session is created or resumed. The model list shows a “New session” badge. Choosing CodeBuddy in the picker of a session that already uses the DeepSeek loop does not move that session onto the CLI. A session created while the default provider is `codebuddy` uses the CLI.
 - User messages that contain non-text blocks are refused before the CLI starts.
 - File bodies are not reconstructed from `file-history-snapshot`. A diff appears only when the tool result text or a normal workspace-changes turn snapshot already has it.
 - `query()` is one CLI process per DSH turn. The next turn passes `--resume`. Interrupt acknowledgement is not treated as exit.
 - Visual Web acceptance was not run. Tool rows use the existing `tool/call` cards.
-- A passing fixture checks the stream-json projection and one `plugin_manager` discovery plus call. It does not run `install_bundle`, and it does not exercise plugin-manager UI or hot reload.
+- A passing fixture checks the stream-json projection and one `plugin_manager` discovery plus call against `@tencent-ai/agent-sdk@0.3.244`. It does not run a CodeBuddy CLI binary, `install_bundle`, the plugin-manager UI, or hot reload. Approval stays fail-closed; there is no default allow and no permission bypass.
 - The projection is not a lossless copy. Non-text user input is refused. Thinking signatures, redacted thinking, and image bytes are not stored. `file-history-snapshot` is not rebuilt into files.
 
 <a id="dev-note"></a>
