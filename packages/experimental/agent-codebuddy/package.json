@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-agent-codebuddy",
   "description": "Drive a DSH session with a locally installed CodeBuddy CLI, keeping DeepSeek sessions on the default loop.",
-  "version": "0.2.2-rc.1",
+  "version": "0.2.2-rc.2",
   "publishConfig": {
     "access": "public"
   },
