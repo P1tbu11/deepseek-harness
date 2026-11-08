@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions, Inbox, InboxTarget } from '@deepseek-ai/dsh-agent'
-import { agentEvents, type AgentEventDispatch } from '@deepseek-ai/dsh-agent'
+import { agentEvents, assembleContextFor, type AgentEventDispatch } from '@deepseek-ai/dsh-agent'
 import { AgentModel } from '@deepseek-ai/dsh-agent'
 import type { ModelSelectionProjectionState } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
@@ -11,16 +11,27 @@ import type {
   AgentCancelCause, Session, UserMessage,
 } from '@deepseek-ai/dsh-session'
 import {
-  createAssistantMessage, createToolResultMessage, LlmAttemptId, ToolCallId,
+  canonicalHeader, headerEquals,
+} from '@deepseek-ai/dsh-session'
+import {
+  AssistantStreamAccumulator,
+  type AssistantStreamRecord,
+} from '@deepseek-ai/dsh-llm/assistant-stream'
+import { BlockAssembler } from '@deepseek-ai/dsh-llm'
+import {
+  createAssistantMessage, createToolResultMessage, LlmAttemptId, markAgentLoopRequest, ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
-import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type {
+  ContentBlock, FinishReason, GenerateOptions, LlmCallConfig, ReplayEnvelope, StreamChunk, TokenUsage,
+} from '@deepseek-ai/dsh-llm'
+import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { handleBridgeCall, type McpCall } from './bridge.ts'
 import type { CliBinding } from './bindings.ts'
 import { BRIDGE_TOOL, CODEBUDDY_PROVIDER, CREATOR_PRESET, DEFAULT_MODEL_ID } from './constants.ts'
 import { discoverModels } from './models.ts'
 import {
-  Projector, withoutDuplicateResultText, type ProtocolFault, type ProtocolMessage,
+  Projector, withoutDuplicateResultText, type AssistantOut, type ProtocolFault, type ProtocolMessage,
 } from './protocol.ts'
 import { startQuery, type CliQuery } from './transport.ts'
 
@@ -288,7 +299,7 @@ export async function runCliTurn(input: {
           })
           chunkIndex += 1
         } else if (event.kind === 'usage') {
-          usage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens }
+          usage = event.usage
         } else if (event.kind === 'assistant') {
           const text = event.blocks.filter(block => block.type === 'text').map(block => block.text).join('')
           if (text !== '') committed.push(text)
@@ -370,6 +381,283 @@ export async function runCliTurn(input: {
   }
 }
 
+/**
+ * Run one turn through a native harness model call instead of the CLI.
+ *
+ * This is what makes a mid-session provider switch work. The Session log is the
+ * only conversation state either path reads, so a turn taken here continues a
+ * conversation the CLI produced, and the next CLI turn continues this one: the
+ * history a model sees is always the committed log, never a per-driver copy.
+ *
+ * The sequence mirrors what `agent-loop` does for a step — assemble the prompt,
+ * let `agent/request` settle the call config (compaction hooks in there and can
+ * reject an unpriceable target), stream the model, commit the assistant
+ * message, then run any tool calls through the native batch executor — but
+ * bounded to a single step, because this Agent drives one turn per inbox item
+ * rather than looping.
+ *
+ * Tool calls are logged by the batch executor itself when `log` is supplied, so
+ * the durable tool/call and tool/result rows appear exactly as they do under
+ * `agent-loop`.
+ * @param input - host, agent, session, turn, the selected route, and cancellation.
+ * @returns nothing; every outcome is committed as a Session event.
+ */
+export async function runNativeTurn(input: {
+  readonly ctx: Context
+  readonly agent: Agent
+  readonly session: Session
+  readonly turn: number
+  /** The claimed inbox message, appended as-is so the client retires its row. */
+  readonly message: UserMessage
+  readonly selection: ModelSelection
+  readonly signal: AbortSignal
+  readonly dispatch: AgentEventDispatch
+  readonly nextRevision: () => number
+}): Promise<void> {
+  const { session, selection, signal } = input
+  const turn = input.turn
+  const step = 1
+  session.append('turn/start', { turn })
+  // Append the claimed message itself, matching the CLI path: the Chat client
+  // hides an inbox row by the id it claimed, so a rebuilt copy would render twice.
+  session.append('user/message', input.message, { surfaceOp: 'append' })
+  const attempt = LlmAttemptId(`native-${turn}`)
+  let started = false
+  let chunkIndex = 0
+  session.append('step/start', { turn, step })
+
+  const finishLive = (seq: number | undefined): void => {
+    if (!started) return
+    input.dispatch.emit('agent/assistant-stream', {
+      frame: {
+        type: 'end', attemptId: attempt, revision: input.nextRevision(), index: chunkIndex,
+        outcome: seq === undefined
+          ? { kind: 'abandoned' }
+          : { kind: 'committed', eventType: 'assistant/message', seq: SessionSeq(seq) },
+      },
+    })
+    started = false
+    chunkIndex = 0
+  }
+
+  try {
+    const tools = input.ctx.tools
+    const toolSet = await tools.resolve({ agent: input.agent, modelSelection: selection, signal })
+    try {
+      const assembly = await input.ctx.systemPrompt.assemble({
+        ...assembleContextFor(input.agent, signal), modelSelection: selection, toolSet,
+      })
+      signal.throwIfAborted()
+
+      // Compaction rewrites history in place, so the request is built after it
+      // had its say rather than before.
+      const proposed = await input.dispatch.waterfall(
+        'agent/request', { turn, step, signal },
+        () => Promise.resolve<LlmCallConfig>({ ...selection }),
+      )
+      signal.throwIfAborted()
+      const prepared = await input.ctx.llm.prepareCall(proposed, signal)
+      const config = prepared.config
+
+      const header = canonicalHeader({
+        config,
+        ...prepared.adapterDefaults === undefined ? {} : { adapterDefaults: prepared.adapterDefaults },
+        ...assembly.tools.length > 0 ? { tools: assembly.tools } : {},
+      })
+      const baseline = session.requestHeader()
+      if (baseline === undefined) {
+        session.append('request/header', { header, reason: 'initial' })
+      } else if (!headerEquals(baseline, header)) {
+        session.append('request/header', { header, reason: 'change' })
+      }
+
+      const request: GenerateOptions = markAgentLoopRequest(Object.freeze({
+        ...config,
+        messages: session.deriveMessages(),
+        toolHistory: session.toolHistory(),
+        ...assembly.tools.length > 0 ? { tools: assembly.tools } : {},
+        sessionId: session.id,
+        signal,
+      }))
+
+      const live = new NativeStream(input, attempt)
+      let failure: unknown
+      try {
+        const stream = prepared.stream(request)
+        signal.throwIfAborted()
+        live.start()
+        started = true
+        for await (const chunk of stream) {
+          signal.throwIfAborted()
+          live.push(chunk)
+        }
+        signal.throwIfAborted()
+      } catch (error: unknown) {
+        failure = error
+        // A stopped or broken call still owes the client what it already showed.
+        // `agent-loop` commits the visible prefix as an interrupted message for a
+        // cancellation, and a stream-less attempt record otherwise, so the
+        // transient rows retire instead of hanging.
+        const content = signal.aborted ? live.interruptedBlocks() : []
+        if (content.length > 0) {
+          session.append('assistant/message', {
+            turn,
+            step,
+            message: createAssistantMessage({
+              content,
+              source: { provider: config.provider, model: config.model },
+            }),
+            interrupted: true,
+            ...live.usage === undefined ? {} : { usage: live.usage },
+            stream: live.stream,
+          }, { surfaceOp: 'append' })
+          finishLive(undefined)
+        } else {
+          session.append('assistant/attempt', { turn, step, stream: live.stream })
+          finishLive(undefined)
+        }
+        throw error
+      }
+
+      if (failure !== undefined) {
+        session.append('assistant/attempt', { turn, step, stream: live.stream })
+        finishLive(undefined)
+        throw failure
+      }
+
+      const blocks = live.blocks()
+      const seq = session.append('assistant/message', {
+        turn,
+        step,
+        message: createAssistantMessage({
+          content: blocks,
+          source: {
+            provider: config.provider,
+            model: config.model,
+            ...live.replayState === undefined ? {} : { replayState: live.replayState },
+          },
+        }),
+        stream: live.stream,
+        ...live.usage === undefined ? {} : { usage: live.usage },
+      }, { surfaceOp: 'append' }).seq
+      finishLive(seq)
+
+      const calls = blocks.filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
+      if (calls.length > 0) {
+        const batch = await tools.execute({
+          calls,
+          signal,
+          agent: input.agent,
+          toolSet,
+          log: { turn, step },
+        })
+        // A tool may hand the loop more context for the next step; record it so
+        // the following request sees it, matching agent-loop's behaviour.
+        for (const message of batch.additionalContexts) {
+          session.append('user/message', message, { surfaceOp: 'append' })
+        }
+      }
+      session.append('step/end', { turn, step })
+      const reason = live.finish
+      if (reason.kind === 'error' || reason.kind === 'aborted') {
+        session.append('turn/end', {
+          turn,
+          reason: { kind: 'error', error: { message: live.failure ?? 'the model call failed', code: 'NATIVE_CALL' } },
+        })
+      } else {
+        session.append('turn/end', { turn, reason: { kind: 'completed' } })
+      }
+      await input.dispatch.serial('agent/turn-stopping', { turn, signal })
+    } finally {
+      toolSet.dispose()
+    }
+  } catch (error: unknown) {
+    // A turn that throws before its boundaries were committed still owes the
+    // client a closed step and turn, or the UI keeps them open forever.
+    if (session.snapshotEvents().at(-1)?.type !== 'turn/end') {
+      session.append('step/end', { turn, step })
+      session.append('turn/end', {
+        turn,
+        reason: {
+          kind: 'error',
+          error: { message: error instanceof Error ? error.message : String(error), code: 'NATIVE_TURN' },
+        },
+      })
+    }
+    throw error
+  }
+}
+
+/**
+ * Fold one native model stream into the durable chunks `agent-loop` records.
+ *
+ * Built on the harness accumulators rather than a bespoke switch: they decide
+ * how chunks compact into `AssistantStreamRecord`s and how blocks assemble into
+ * the settled message, which is exactly what a CLI-produced message contains
+ * too. Reusing them keeps a switched-to native turn indistinguishable in the log
+ * from a turn the stock loop would have written.
+ *
+ * Kept apart from `Projector`, which translates the CLI's NDJSON vocabulary into
+ * these same chunks.
+ */
+class NativeStream {
+  private readonly accumulator = new AssistantStreamAccumulator()
+  private readonly assembler = new BlockAssembler()
+  private index = 0
+  usage: TokenUsage | undefined
+  replayState: ReplayEnvelope | undefined
+  finish: FinishReason = { kind: 'stop' }
+  failure: string | undefined
+  opened = false
+
+  constructor(
+    private readonly input: {
+      readonly dispatch: AgentEventDispatch
+      readonly nextRevision: () => number
+    },
+    private readonly attempt: LlmAttemptId,
+  ) {}
+
+  start(): void {
+    this.opened = true
+  }
+
+  /** Record one chunk, publish it as a live frame, and fold it into the attempt. */
+  push(chunk: StreamChunk): void {
+    const timed = this.accumulator.push({ time: Date.now(), chunk })
+    this.assembler.push(timed.chunk)
+    this.input.dispatch.emit('agent/assistant-stream', {
+      frame: {
+        type: 'chunk', attemptId: this.attempt, revision: this.input.nextRevision(),
+        index: this.index++, time: timed.time, chunk: timed.chunk,
+      },
+    })
+    if (chunk.type === 'usage') this.usage = chunk.usage
+    if (chunk.type === 'finish') {
+      this.finish = chunk.reason
+      this.replayState = chunk.replayState
+      if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+        this.failure = chunk.reason.failure.message
+      }
+    }
+  }
+
+  /** Canonical blocks for the durable message. */
+  blocks(): ContentBlock[] {
+    return this.assembler.blocks()
+  }
+
+  /** Visible prefix when cancellation interrupted the attempt. */
+  interruptedBlocks(): ContentBlock[] {
+    return this.assembler.interruptedBlocks()
+  }
+
+  /** Exact compact stream for the durable event. */
+  get stream(): AssistantStreamRecord[] {
+    return [...this.accumulator.snapshot()] as AssistantStreamRecord[]
+  }
+}
+
 function previousSeq(session: Session): ReturnType<typeof SessionSeq> {
   const events = session.snapshotEvents()
   return events.at(-1)?.seq ?? SessionSeq(0)
@@ -420,14 +708,20 @@ function appendAssistant(
   session: Session,
   turn: number,
   step: number,
-  blocks: readonly { type: 'text' | 'reasoning'; text: string }[],
+  blocks: readonly AssistantOut[],
   usage: TokenUsage | undefined,
   model: string,
 ): number {
+  // Tool-call blocks are carried in the message, the way `agent-loop` records
+  // them. `tool/result` projects into the model-visible history while `tool/call`
+  // does not, so a call recorded only as its own event would leave the following
+  // result orphaned and break a later native turn's DeepSeek serialization.
   const content: ContentBlock[] = blocks.map(block => block.type === 'text'
     ? { type: 'text', text: block.text }
-    : { type: 'reasoning', text: block.text })
-  const text = blocks.filter(block => block.type === 'text').map(block => block.text)
+    : block.type === 'reasoning'
+      ? { type: 'reasoning', text: block.text }
+      : { type: 'tool-call', id: ToolCallId(block.id), name: block.name, arguments: block.arguments })
+  const text = blocks.filter(block => block.type === 'text').map(block => block.type === 'text' ? block.text : '')
   const event = session.append('assistant/message', {
     turn,
     step,
@@ -732,21 +1026,6 @@ export class CodeBuddyAgent implements Agent {
     return ''
   }
 
-  /**
-   * The recorded selection when it belongs to another provider, or undefined.
-   *
-   * Model ids are provider-scoped, so a selection from another route names a
-   * model this driver cannot run. Reported before a turn starts rather than
-   * forwarded to the CLI as an unknown id.
-   * @returns the foreign selection, or undefined when the session's own
-   * provider is selected (or nothing is recorded yet).
-   */
-  private foreignSelection(): { provider: string; model: string } | undefined {
-    const selected = this.model.current()
-    if (selected === undefined || selected.provider === CODEBUDDY_PROVIDER) return undefined
-    return { provider: selected.provider, model: selected.model }
-  }
-
   private wake(): void {
     if (this.phase === 'running') return
     const done = Promise.withResolvers<void>()
@@ -812,31 +1091,38 @@ export class CodeBuddyAgent implements Agent {
         this.turn += 1
         continue
       }
-      const foreign = this.foreignSelection()
-      if (foreign !== undefined) {
-        // The session is a CodeBuddy session for life: selecting a model from
-        // another provider records a choice this driver cannot run, and no
-        // retry can change that. Say so once, with the two ways out, instead of
-        // sending an id the CLI does not know.
-        this.session.append('turn/start', { turn: this.turn + 1 })
-        this.session.append('turn/end', {
-          turn: this.turn + 1,
-          reason: {
-            kind: 'error',
-            error: {
-              message: 'This session runs the CodeBuddy CLI, whose model ids are its own: '
-                + `${foreign.provider}/${foreign.model} cannot be passed to it. `
-                + 'Select a CodeBuddy model, or start a new session on that provider.',
-              code: 'UNSUPPORTED_MODEL',
-            },
-          },
-        })
-        this.turn += 1
-        continue
-      }
       this.turn += 1
       const controller = new AbortController()
       this.active = controller
+      // Route by the selected provider, re-read every turn so a mid-session
+      // switch takes effect on the next message. A CodeBuddy selection drives
+      // the resident CLI; anything else is a native model call this Agent makes
+      // through the harness, over the very same Session log — which is what
+      // keeps the conversation intact across the switch.
+      const selection = this.model.current()
+      if (selection !== undefined && selection.provider !== CODEBUDDY_PROVIDER) {
+        try {
+          await runNativeTurn({
+            ctx: this.host,
+            agent: this,
+            session: this.session,
+            turn: this.turn,
+            message,
+            selection,
+            signal: controller.signal,
+            dispatch: this.dispatch,
+            nextRevision: () => ++this.assistantRevision,
+          })
+        } catch (error: unknown) {
+          const messageText = error instanceof Error ? error.message : 'native turn failed'
+          this.session.append('turn/start', { turn: this.turn })
+          this.session.append('turn/end', {
+            turn: this.turn,
+            reason: { kind: 'error', error: { message: messageText, code: 'NATIVE_TURN' } },
+          })
+        }
+        continue
+      }
       try {
         const creator = this.currentPreset() === CREATOR_PRESET
         const model = this.cliModel()

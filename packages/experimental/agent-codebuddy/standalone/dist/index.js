@@ -1,14 +1,15 @@
 import { Service } from "@deepseek-ai/cordis";
-import { AgentModel, agentEvents, modelSelectionProjectionDefinition } from "@deepseek-ai/dsh-agent";
+import { AgentModel, agentEvents, assembleContextFor, modelSelectionProjectionDefinition } from "@deepseek-ai/dsh-agent";
 import AgentLoop from "@deepseek-ai/dsh-agent-loop";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
-import { LlmAdapter, LlmAttemptId, LlmError, ToolCallId, createAssistantMessage, createToolResultMessage } from "@deepseek-ai/dsh-llm";
+import { BlockAssembler, LlmAdapter, LlmAttemptId, LlmError, ToolCallId, createAssistantMessage, createToolResultMessage, markAgentLoopRequest } from "@deepseek-ai/dsh-llm";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { createScope } from "@deepseek-ai/dsh-scope";
 import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
-import { SessionSeq } from "@deepseek-ai/dsh-session";
+import { SessionSeq, canonicalHeader, headerEquals } from "@deepseek-ai/dsh-session";
+import { AssistantStreamAccumulator } from "@deepseek-ai/dsh-llm/assistant-stream";
 //#region lib/types/bindings.js
 /**
 * Read the session map. A missing file is an empty map. Malformed JSON throws.
@@ -118,6 +119,81 @@ async function assertFile(path, timeoutMs) {
 	} finally {
 		if (timer !== void 0) clearTimeout(timer);
 	}
+}
+//#endregion
+//#region lib/types/dsml.js
+/**
+* Detection and removal of DeepSeek's inline tool-call markup.
+*
+* DeepSeek models usually ask for a tool through the structured `tool_use`
+* channel, which this plugin turns into a real tool call. Occasionally a model
+* instead writes that intent as literal text using its own inline syntax:
+*
+* ```
+* <｜｜DSML｜｜ calls>
+* <｜｜DSML｜｜ invoke name="bash">
+* <｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜ parameter>
+* </｜｜ invoke>
+* </｜｜ calls>
+* ```
+*
+* The CLI forwards whatever the model produced, so a turn like that reaches the
+* Session as ordinary text and renders as markup in the chat. It is a model
+* behaviour, not a serialization fault: the same conversation is visible in
+* CodeBuddy's own traces before this plugin drives it, and such a turn ends with
+* `finish: stop` rather than `tool-calls`, proving no tool was requested
+* structurally.
+*
+* This module strips that markup so nothing unreadable reaches the transcript.
+* It is deliberately NOT a recovery path: turning the text back into an executed
+* tool call would guess at an intent the model never declared, and a model that
+* wrote markup once will be told the tool did not run. Stripping keeps the
+* conversation honest and the transcript clean.
+*
+* The markers use fullwidth vertical bars (U+FF5C) and an opaque id — `｜DSML｜`,
+* apparently an encoding of "deepseek" — so they cannot be matched by a simple
+* `<tag>` grammar. Closing tags are also frequently malformed, dropping the id
+* down to `</｜｜ parameter>`, so the patterns accept either shape.
+*
+* @module @deepseek-ai/dsh-agent-codebuddy/dsml
+*/
+/** Fullwidth vertical bar that delimits every inline marker. */
+const BAR = "｜";
+/**
+* One delimiter run: a `<`, one or two fullwidth bars around an optional short
+* id, then another bar run.
+*
+* A model writes `｜｜DSML｜｜` when it opens a tag and `｜｜` when it truncates the
+* closing one, so the id is optional. Matching a *run* of bars rather than
+* exactly two is what lets `<｜｜DSML｜｜ …>` and `</｜｜ …>` share one grammar.
+*/
+const OPEN = `<${BAR}+(?:[^${BAR}\\n>]{0,24})?${BAR}+\\s*`;
+/** The closing form, which drops the id: `</｜｜ tag>`. */
+const CLOSE = `<\\/${BAR}+(?:[^${BAR}\\n>]{0,24})?${BAR}+\\s*`;
+/** A complete inline-call block, from its `calls` wrapper to its close. */
+const CALL_BLOCK = new RegExp(`${OPEN}calls\\s*>[\\s\\S]*?${CLOSE}calls\\s*>`, "g");
+/**
+* A stray marker with its tag name, for a block whose wrapper is cut off.
+*
+* This catches the inner fragments (`parameter`, `invoke`) when the enclosing
+* `calls` element never arrived, which also happens on a truncated stream.
+*/
+const LOOSE_MARKER = new RegExp(`(?:${OPEN}|${CLOSE})(?:invoke|parameter|calls)\\b[^>]*>`, "g");
+/**
+* Remove inline tool-call markup from one text fragment.
+*
+* The visible prose around a marker is kept: a model that narrates and then
+* emits markup should still show the narration. Only the markup itself and the
+* blank lines it leaves behind are dropped, so the result reads as the sentence
+* the model meant to say.
+* @param text - one assistant text block, verbatim from the CLI.
+* @returns the text without markup, or the input unchanged when none is present.
+*/
+function stripInlineToolCalls(text) {
+	if (!text.includes(BAR)) return text;
+	const stripped = text.replace(CALL_BLOCK, "").replace(LOOSE_MARKER, "");
+	if (stripped === text) return text;
+	return stripped.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 //#endregion
 //#region lib/types/protocol.js
@@ -330,37 +406,34 @@ var Projector = class {
 				events.push(diagnostic("UNKNOWN_BLOCK", "assistant content block is not an object"));
 				continue;
 			}
-			if (item.type === "text" && typeof item.text === "string") blocks.push({
-				type: "text",
-				text: item.text
-			});
-			else if (item.type === "thinking" && typeof item.thinking === "string") blocks.push({
+			if (item.type === "text" && typeof item.text === "string") {
+				const text = stripInlineToolCalls(item.text);
+				if (text !== item.text) events.push(diagnostic("INLINE_TOOL_MARKUP", "stripped inline tool markup from assistant text"));
+				if (text !== "") blocks.push({
+					type: "text",
+					text
+				});
+			} else if (item.type === "thinking" && typeof item.thinking === "string") blocks.push({
 				type: "reasoning",
 				text: item.thinking
 			});
 			else if (item.type === "redacted_thinking") events.push(diagnostic("REDACTED_THINKING", "redacted thinking was not copied"));
 			else if (item.type === "tool_use") {
-				if (blocks.length > 0) {
-					events.push({
-						kind: "assistant",
-						blocks: [...blocks]
-					});
-					blocks.length = 0;
-					this.resetLive();
-				}
-				events.push(...this.toolUse(item));
+				const call = this.toolUse(item);
+				if (call.blocks !== void 0) blocks.push(call.blocks);
+				events.push(...call.projected);
 			} else if (item.type === "image") events.push(diagnostic("IMAGE_OMITTED", "assistant image bytes were not copied"));
 			else events.push(diagnostic("UNKNOWN_BLOCK", `assistant block "${String(item.type)}"`));
 		}
-		if (blocks.length > 0) events.push({
+		if (blocks.length > 0) events.unshift({
 			kind: "assistant",
 			blocks
 		});
 		this.resetLive();
 		const usage = usageOf(body?.usage);
-		if (usage !== void 0) events.push({
+		if (usage !== void 0) events.unshift({
 			kind: "usage",
-			...usage
+			usage
 		});
 		return events;
 	}
@@ -394,23 +467,41 @@ var Projector = class {
 		}
 		return blocks.some((block) => block.type === "text") ? blocks : [];
 	}
+	/**
+	* Read one `tool_use` block as both a message block and its presentation event.
+	*
+	* The block goes into the assistant message so the model-visible history pairs
+	* it with the `tool/result` that follows; the event tells the driver to record
+	* that call row. Both are needed, and they are produced together so a caller
+	* cannot take one without the other.
+	* @param item - the CLI `tool_use` content block.
+	* @returns the assistant block and the tool-call projection.
+	*/
 	toolUse(item) {
 		const id = typeof item.id === "string" ? item.id : "";
 		const name = typeof item.name === "string" ? item.name : "";
-		if (id === "" || name === "") return [diagnostic("MALFORMED_TOOL", "tool_use is missing id or name")];
+		if (id === "" || name === "") return { projected: [diagnostic("MALFORMED_TOOL", "tool_use is missing id or name")] };
 		this.openTools.add(id);
 		let args = "";
 		try {
 			args = JSON.stringify(item.input ?? {});
 		} catch {
-			return [diagnostic("MALFORMED_TOOL", `tool_use "${id}" input is not JSON`)];
+			return { projected: [diagnostic("MALFORMED_TOOL", `tool_use "${id}" input is not JSON`)] };
 		}
-		return [{
-			kind: "tool-call",
-			id,
-			name,
-			arguments: args
-		}];
+		return {
+			blocks: {
+				type: "tool-call",
+				id,
+				name,
+				arguments: args
+			},
+			projected: [{
+				kind: "tool-call",
+				id,
+				name,
+				arguments: args
+			}]
+		};
 	}
 	user(message) {
 		const content = record$1(message.message)?.content;
@@ -507,15 +598,56 @@ function toolResultText(content) {
 		return item?.type === "text" && typeof item.text === "string" ? item.text : "";
 	}).join("");
 }
+/**
+* Wire field to harness field for every token counter the two vocabularies share.
+*
+* The CLI and the harness name the same four numbers; only the spelling of the
+* cache counters differs.
+*/
+const USAGE_FIELDS$1 = {
+	input_tokens: "inputTokens",
+	output_tokens: "outputTokens",
+	cache_read_input_tokens: "cacheReadTokens",
+	cache_creation_input_tokens: "cacheWriteTokens"
+};
+/**
+* Copy one CLI usage object onto the harness vocabulary.
+*
+* Two corrections make the numbers mean what the harness expects.
+*
+* 1. The cache counters are carried over at all. Reading only input/output
+*    threw them away, so a CLI-driven Session reported no cache hit rate even
+*    though the CLI sends it in every assistant frame.
+*
+* 2. `input_tokens` is reduced to its uncached part. The CLI follows the
+*    Messages convention and folds cache reads into that total — a live call
+*    reported `input_tokens: 30513` beside `cache_read_input_tokens: 30336`,
+*    where 30513 − 30336 = 177 is the uncached input, the same 177 the CLI
+*    publishes as `modelUsage.inputTokens`. The harness requires the three
+*    counters to be disjoint, and its context gauge sums them, so leaving the
+*    total in place double-counted the prompt and halved the hit rate.
+* @param value - a provider usage object from any frame that carries one.
+* @returns the disjoint harness usage, or undefined when nothing was reported.
+*/
 function usageOf(value) {
 	const usage = record$1(value);
 	if (usage === void 0) return void 0;
-	const input = numberField(usage, "input_tokens");
-	const output = numberField(usage, "output_tokens");
-	if (input === void 0 || output === void 0) return void 0;
+	const counters = {};
+	for (const [wire, local] of Object.entries(USAGE_FIELDS$1)) {
+		const counter = numberField(usage, wire);
+		if (counter !== void 0) counters[local] = counter;
+	}
+	const output = counters.outputTokens;
+	const rawInput = counters.inputTokens;
+	if (output === void 0 || rawInput === void 0) return void 0;
+	const cacheRead = counters.cacheReadTokens ?? 0;
+	const cacheWrite = counters.cacheWriteTokens ?? 0;
 	return {
-		inputTokens: input,
-		outputTokens: output
+		inputTokens: Math.max(0, rawInput - cacheRead - cacheWrite),
+		outputTokens: output,
+		totalTokens: rawInput + output,
+		...cacheRead === 0 ? {} : { cacheReadTokens: cacheRead },
+		...cacheWrite === 0 ? {} : { cacheWriteTokens: cacheWrite }
 	};
 }
 function numberField(message, key) {
@@ -751,16 +883,28 @@ const USAGE_FIELDS = {
 *
 * The CLI reports the same counters in several frames that supersede one
 * another, so later values overwrite earlier ones instead of accumulating.
+*
+* `input_tokens` is reduced to its uncached part. The CLI folds cache reads
+* into that total (a live call reported 30513 alongside 30336 cached, leaving
+* 177 uncached), while the harness requires the counters to be disjoint and
+* sums them for its context gauge. Keeping the total double-counted the prompt.
 * @param target - the running usage value.
 * @param raw - a provider usage object.
 */
 function readUsage(target, raw) {
 	const usage = record(raw);
 	if (usage === void 0) return;
+	const counters = {};
 	for (const [wire, local] of Object.entries(USAGE_FIELDS)) {
 		const value = usage[wire];
-		if (typeof value === "number" && Number.isFinite(value) && value >= 0) target[local] = value;
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0) counters[local] = value;
 	}
+	if (counters.outputTokens !== void 0) target.outputTokens = counters.outputTokens;
+	const cacheRead = counters.cacheReadTokens ?? 0;
+	const cacheWrite = counters.cacheWriteTokens ?? 0;
+	if (counters.inputTokens !== void 0) target.inputTokens = Math.max(0, counters.inputTokens - cacheRead - cacheWrite);
+	if (counters.cacheReadTokens !== void 0) target.cacheReadTokens = cacheRead;
+	if (counters.cacheWriteTokens !== void 0) target.cacheWriteTokens = cacheWrite;
 }
 /** Map the CLI's stop reason onto the harness vocabulary. */
 function stopReason(raw) {
@@ -1313,31 +1457,17 @@ function parseToolList(text) {
 //#endregion
 //#region lib/types/catalog.js
 /**
-* Context capacity advertised for every model this route serves.
+* Fallback context capacity, used only when a profile supplies none.
 *
-* The CLI hides which backend model a given id resolves to, so the plugin
-* cannot read a per-model window from the CLI. It must still publish one:
-* the session-controller compares a conversation's size against the target
-* model's window before it switches models, and an adapter that reports no
-* capacity fails that switch outright rather than being treated as generous.
-*
-* 1,048,576 matches what the official DeepSeek listing declares for the models
-* the CLI is normally pointed at, and it is the conservative choice against a
-* larger unknown window: too small compacts earlier than necessary, while too
-* large lets a request overflow. A deployment whose CLI runs a smaller model
-* must lower this through settings.
+* CodeBuddy publishes both numbers in `modelUsage` of every result frame; a live
+* call against `deepseek-v4.1-flash` announced `contextWindow: 1000000` and
+* `maxOutputTokens: 128000`. The deployment setting is preferred because it can
+* follow whatever backend the CLI is pointed at, while this keeps an unconfigured
+* plugin sized like the build it normally runs.
 */
-const CODEBUDDY_CONTEXT_WINDOW = 1048576;
-/**
-* Output tokens reserved out of {@link CODEBUDDY_CONTEXT_WINDOW} when the
-* compaction planner sizes a switch.
-*
-* The CLI owns its own completion budget, so this is not enforced by the
-* adapter; it only stops the planner from treating the whole window as free
-* input space. 8,192 is a typical coding-agent answer and leaves the rest of a
-* large window usable.
-*/
-const CODEBUDDY_DEFAULT_MAX_TOKENS = 8192;
+const FALLBACK_CONTEXT_WINDOW = 1e6;
+/** Fallback completion reserve, matching the same build's announced maximum. */
+const FALLBACK_MAX_OUTPUT_TOKENS = 128e3;
 /**
 * Publish `codebuddy` on the existing provider catalog.
 *
@@ -1420,8 +1550,8 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 	async resolveModel(provider, model) {
 		const catalog = await this.catalog();
 		const capacity = {
-			context: { contextWindow: CODEBUDDY_CONTEXT_WINDOW },
-			defaultMaxTokens: CODEBUDDY_DEFAULT_MAX_TOKENS
+			context: { contextWindow: this.settings.config.contextWindow || FALLBACK_CONTEXT_WINDOW },
+			defaultMaxTokens: this.settings.config.maxOutputTokens || FALLBACK_MAX_OUTPUT_TOKENS
 		};
 		if (model === "default") {
 			const configured = catalog.configured;
@@ -1771,10 +1901,7 @@ async function runCliTurn(input) {
 					chunk: event.chunk
 				} });
 				chunkIndex += 1;
-			} else if (event.kind === "usage") usage = {
-				inputTokens: event.inputTokens,
-				outputTokens: event.outputTokens
-			};
+			} else if (event.kind === "usage") usage = event.usage;
 			else if (event.kind === "assistant") {
 				const text = event.blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
 				if (text !== "") committed.push(text);
@@ -1871,6 +1998,291 @@ async function runCliTurn(input) {
 		});
 	}
 }
+/**
+* Run one turn through a native harness model call instead of the CLI.
+*
+* This is what makes a mid-session provider switch work. The Session log is the
+* only conversation state either path reads, so a turn taken here continues a
+* conversation the CLI produced, and the next CLI turn continues this one: the
+* history a model sees is always the committed log, never a per-driver copy.
+*
+* The sequence mirrors what `agent-loop` does for a step — assemble the prompt,
+* let `agent/request` settle the call config (compaction hooks in there and can
+* reject an unpriceable target), stream the model, commit the assistant
+* message, then run any tool calls through the native batch executor — but
+* bounded to a single step, because this Agent drives one turn per inbox item
+* rather than looping.
+*
+* Tool calls are logged by the batch executor itself when `log` is supplied, so
+* the durable tool/call and tool/result rows appear exactly as they do under
+* `agent-loop`.
+* @param input - host, agent, session, turn, the selected route, and cancellation.
+* @returns nothing; every outcome is committed as a Session event.
+*/
+async function runNativeTurn(input) {
+	const { session, selection, signal } = input;
+	const turn = input.turn;
+	const step = 1;
+	session.append("turn/start", { turn });
+	session.append("user/message", input.message, { surfaceOp: "append" });
+	const attempt = LlmAttemptId(`native-${turn}`);
+	let started = false;
+	let chunkIndex = 0;
+	session.append("step/start", {
+		turn,
+		step
+	});
+	const finishLive = (seq) => {
+		if (!started) return;
+		input.dispatch.emit("agent/assistant-stream", { frame: {
+			type: "end",
+			attemptId: attempt,
+			revision: input.nextRevision(),
+			index: chunkIndex,
+			outcome: seq === void 0 ? { kind: "abandoned" } : {
+				kind: "committed",
+				eventType: "assistant/message",
+				seq: SessionSeq(seq)
+			}
+		} });
+		started = false;
+		chunkIndex = 0;
+	};
+	try {
+		const tools = input.ctx.tools;
+		const toolSet = await tools.resolve({
+			agent: input.agent,
+			modelSelection: selection,
+			signal
+		});
+		try {
+			const assembly = await input.ctx.systemPrompt.assemble({
+				...assembleContextFor(input.agent, signal),
+				modelSelection: selection,
+				toolSet
+			});
+			signal.throwIfAborted();
+			const proposed = await input.dispatch.waterfall("agent/request", {
+				turn,
+				step,
+				signal
+			}, () => Promise.resolve({ ...selection }));
+			signal.throwIfAborted();
+			const prepared = await input.ctx.llm.prepareCall(proposed, signal);
+			const config = prepared.config;
+			const header = canonicalHeader({
+				config,
+				...prepared.adapterDefaults === void 0 ? {} : { adapterDefaults: prepared.adapterDefaults },
+				...assembly.tools.length > 0 ? { tools: assembly.tools } : {}
+			});
+			const baseline = session.requestHeader();
+			if (baseline === void 0) session.append("request/header", {
+				header,
+				reason: "initial"
+			});
+			else if (!headerEquals(baseline, header)) session.append("request/header", {
+				header,
+				reason: "change"
+			});
+			const request = markAgentLoopRequest(Object.freeze({
+				...config,
+				messages: session.deriveMessages(),
+				toolHistory: session.toolHistory(),
+				...assembly.tools.length > 0 ? { tools: assembly.tools } : {},
+				sessionId: session.id,
+				signal
+			}));
+			const live = new NativeStream(input, attempt);
+			let failure;
+			try {
+				const stream = prepared.stream(request);
+				signal.throwIfAborted();
+				live.start();
+				started = true;
+				for await (const chunk of stream) {
+					signal.throwIfAborted();
+					live.push(chunk);
+				}
+				signal.throwIfAborted();
+			} catch (error) {
+				failure = error;
+				const content = signal.aborted ? live.interruptedBlocks() : [];
+				if (content.length > 0) {
+					session.append("assistant/message", {
+						turn,
+						step,
+						message: createAssistantMessage({
+							content,
+							source: {
+								provider: config.provider,
+								model: config.model
+							}
+						}),
+						interrupted: true,
+						...live.usage === void 0 ? {} : { usage: live.usage },
+						stream: live.stream
+					}, { surfaceOp: "append" });
+					finishLive(void 0);
+				} else {
+					session.append("assistant/attempt", {
+						turn,
+						step,
+						stream: live.stream
+					});
+					finishLive(void 0);
+				}
+				throw error;
+			}
+			if (failure !== void 0) {
+				session.append("assistant/attempt", {
+					turn,
+					step,
+					stream: live.stream
+				});
+				finishLive(void 0);
+				throw failure;
+			}
+			const blocks = live.blocks();
+			const seq = session.append("assistant/message", {
+				turn,
+				step,
+				message: createAssistantMessage({
+					content: blocks,
+					source: {
+						provider: config.provider,
+						model: config.model,
+						...live.replayState === void 0 ? {} : { replayState: live.replayState }
+					}
+				}),
+				stream: live.stream,
+				...live.usage === void 0 ? {} : { usage: live.usage }
+			}, { surfaceOp: "append" }).seq;
+			finishLive(seq);
+			const calls = blocks.filter((block) => block.type === "tool-call");
+			if (calls.length > 0) {
+				const batch = await tools.execute({
+					calls,
+					signal,
+					agent: input.agent,
+					toolSet,
+					log: {
+						turn,
+						step
+					}
+				});
+				for (const message of batch.additionalContexts) session.append("user/message", message, { surfaceOp: "append" });
+			}
+			session.append("step/end", {
+				turn,
+				step
+			});
+			const reason = live.finish;
+			if (reason.kind === "error" || reason.kind === "aborted") session.append("turn/end", {
+				turn,
+				reason: {
+					kind: "error",
+					error: {
+						message: live.failure ?? "the model call failed",
+						code: "NATIVE_CALL"
+					}
+				}
+			});
+			else session.append("turn/end", {
+				turn,
+				reason: { kind: "completed" }
+			});
+			await input.dispatch.serial("agent/turn-stopping", {
+				turn,
+				signal
+			});
+		} finally {
+			toolSet.dispose();
+		}
+	} catch (error) {
+		if (session.snapshotEvents().at(-1)?.type !== "turn/end") {
+			session.append("step/end", {
+				turn,
+				step
+			});
+			session.append("turn/end", {
+				turn,
+				reason: {
+					kind: "error",
+					error: {
+						message: error instanceof Error ? error.message : String(error),
+						code: "NATIVE_TURN"
+					}
+				}
+			});
+		}
+		throw error;
+	}
+}
+/**
+* Fold one native model stream into the durable chunks `agent-loop` records.
+*
+* Built on the harness accumulators rather than a bespoke switch: they decide
+* how chunks compact into `AssistantStreamRecord`s and how blocks assemble into
+* the settled message, which is exactly what a CLI-produced message contains
+* too. Reusing them keeps a switched-to native turn indistinguishable in the log
+* from a turn the stock loop would have written.
+*
+* Kept apart from `Projector`, which translates the CLI's NDJSON vocabulary into
+* these same chunks.
+*/
+var NativeStream = class {
+	input;
+	attempt;
+	accumulator = new AssistantStreamAccumulator();
+	assembler = new BlockAssembler();
+	index = 0;
+	usage;
+	replayState;
+	finish = { kind: "stop" };
+	failure;
+	opened = false;
+	constructor(input, attempt) {
+		this.input = input;
+		this.attempt = attempt;
+	}
+	start() {
+		this.opened = true;
+	}
+	/** Record one chunk, publish it as a live frame, and fold it into the attempt. */
+	push(chunk) {
+		const timed = this.accumulator.push({
+			time: Date.now(),
+			chunk
+		});
+		this.assembler.push(timed.chunk);
+		this.input.dispatch.emit("agent/assistant-stream", { frame: {
+			type: "chunk",
+			attemptId: this.attempt,
+			revision: this.input.nextRevision(),
+			index: this.index++,
+			time: timed.time,
+			chunk: timed.chunk
+		} });
+		if (chunk.type === "usage") this.usage = chunk.usage;
+		if (chunk.type === "finish") {
+			this.finish = chunk.reason;
+			this.replayState = chunk.replayState;
+			if (chunk.reason.kind === "error" || chunk.reason.kind === "aborted") this.failure = chunk.reason.failure.message;
+		}
+	}
+	/** Canonical blocks for the durable message. */
+	blocks() {
+		return this.assembler.blocks();
+	}
+	/** Visible prefix when cancellation interrupted the attempt. */
+	interruptedBlocks() {
+		return this.assembler.interruptedBlocks();
+	}
+	/** Exact compact stream for the durable event. */
+	get stream() {
+		return [...this.accumulator.snapshot()];
+	}
+};
 function previousSeq(session) {
 	return session.snapshotEvents().at(-1)?.seq ?? SessionSeq(0);
 }
@@ -1916,11 +2328,16 @@ function appendAssistant(session, turn, step, blocks, usage, model) {
 	const content = blocks.map((block) => block.type === "text" ? {
 		type: "text",
 		text: block.text
-	} : {
+	} : block.type === "reasoning" ? {
 		type: "reasoning",
 		text: block.text
+	} : {
+		type: "tool-call",
+		id: ToolCallId(block.id),
+		name: block.name,
+		arguments: block.arguments
 	});
-	const text = blocks.filter((block) => block.type === "text").map((block) => block.text);
+	const text = blocks.filter((block) => block.type === "text").map((block) => block.type === "text" ? block.text : "");
 	return session.append("assistant/message", {
 		turn,
 		step,
@@ -2218,23 +2635,6 @@ var CodeBuddyAgent = class {
 		if (this.launch.model !== void 0 && this.launch.model !== "" && this.launch.model !== "default") return this.launch.model;
 		return "";
 	}
-	/**
-	* The recorded selection when it belongs to another provider, or undefined.
-	*
-	* Model ids are provider-scoped, so a selection from another route names a
-	* model this driver cannot run. Reported before a turn starts rather than
-	* forwarded to the CLI as an unknown id.
-	* @returns the foreign selection, or undefined when the session's own
-	* provider is selected (or nothing is recorded yet).
-	*/
-	foreignSelection() {
-		const selected = this.model.current();
-		if (selected === void 0 || selected.provider === "codebuddy") return void 0;
-		return {
-			provider: selected.provider,
-			model: selected.model
-		};
-	}
 	wake() {
 		if (this.phase === "running") return;
 		const done = Promise.withResolvers();
@@ -2301,25 +2701,39 @@ var CodeBuddyAgent = class {
 				this.turn += 1;
 				continue;
 			}
-			const foreign = this.foreignSelection();
-			if (foreign !== void 0) {
-				this.session.append("turn/start", { turn: this.turn + 1 });
-				this.session.append("turn/end", {
-					turn: this.turn + 1,
-					reason: {
-						kind: "error",
-						error: {
-							message: `This session runs the CodeBuddy CLI, whose model ids are its own: ${foreign.provider}/${foreign.model} cannot be passed to it. Select a CodeBuddy model, or start a new session on that provider.`,
-							code: "UNSUPPORTED_MODEL"
-						}
-					}
-				});
-				this.turn += 1;
-				continue;
-			}
 			this.turn += 1;
 			const controller = new AbortController();
 			this.active = controller;
+			const selection = this.model.current();
+			if (selection !== void 0 && selection.provider !== "codebuddy") {
+				try {
+					await runNativeTurn({
+						ctx: this.host,
+						agent: this,
+						session: this.session,
+						turn: this.turn,
+						message,
+						selection,
+						signal: controller.signal,
+						dispatch: this.dispatch,
+						nextRevision: () => ++this.assistantRevision
+					});
+				} catch (error) {
+					const messageText = error instanceof Error ? error.message : "native turn failed";
+					this.session.append("turn/start", { turn: this.turn });
+					this.session.append("turn/end", {
+						turn: this.turn,
+						reason: {
+							kind: "error",
+							error: {
+								message: messageText,
+								code: "NATIVE_TURN"
+							}
+						}
+					});
+				}
+				continue;
+			}
 			try {
 				const creator = this.currentPreset() === CREATOR_PRESET;
 				const model = this.cliModel();

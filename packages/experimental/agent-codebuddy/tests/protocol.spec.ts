@@ -50,3 +50,107 @@ describe('synthetic stream projection', () => {
     expect(projector.push({ type: 'result', subtype: 'success', result: 'again', is_error: false }).fault?.code).toBe('DUPLICATE_RESULT')
   })
 })
+
+describe('usage accounting', () => {
+  /** A real frame captured from the CLI: the total folds in the cache read. */
+  const frame = {
+    type: 'assistant',
+    message: {
+      content: [{ type: 'text', text: 'ok' }],
+      usage: {
+        input_tokens: 30513,
+        output_tokens: 2,
+        cache_read_input_tokens: 30336,
+        cache_creation_input_tokens: 0,
+      },
+    },
+  }
+
+  it('publishes cache counters and keeps the counters disjoint', () => {
+    const usage = new Projector().push(frame).events.find(event => event.kind === 'usage')?.usage
+    // The CLI follows the Messages convention: input_tokens already contains the
+    // cache read, so the uncached part is the reported `modelUsage.inputTokens`
+    // value of 177. The harness sums the three counters for its context gauge.
+    expect(usage).toMatchObject({
+      inputTokens: 177,
+      outputTokens: 2,
+      cacheReadTokens: 30336,
+      totalTokens: 30515,
+    })
+    const context = (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheWriteTokens ?? 0)
+    // Equal to the provider's own prompt total, not twice it.
+    expect(context).toBe(30513)
+    // A folded total would have reported 30513 / 60849 ≈ 50% here.
+    expect((usage?.cacheReadTokens ?? 0) / context).toBeGreaterThan(0.99)
+  })
+
+  it('clamps an input count that a proxy already reports disjointly', () => {
+    // Defensive: some gateways report cache counters without folding them in.
+    const usage = new Projector().push({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 300 },
+      },
+    }).events.find(event => event.kind === 'usage')?.usage
+    expect(usage?.inputTokens).toBe(0)
+    expect(Number.isNaN((usage?.cacheReadTokens ?? 0) / ((usage?.inputTokens ?? 0) + 300))).toBe(false)
+  })
+
+  it('emits usage before the message it prices', () => {
+    // The driver commits the assistant message the moment it sees that
+    // projection, so a usage event ordered after it would never reach the
+    // durable row and every CLI turn would record no usage at all.
+    const events = new Projector().push(frame).events
+    const usageAt = events.findIndex(event => event.kind === 'usage')
+    const assistantAt = events.findIndex(event => event.kind === 'assistant')
+    expect(usageAt).toBeGreaterThanOrEqual(0)
+    expect(usageAt).toBeLessThan(assistantAt)
+  })
+})
+
+describe('inline tool markup in assistant text', () => {
+  /** Captured verbatim from a live Session, including the truncated close tag. */
+  const MARKUP = '\n\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="bash">\n<｜｜DSML｜｜ parameter name="command" string="true">ls</｜｜ parameter>\n</｜｜ invoke>\n</｜｜ calls>'
+
+  it('strips markup from text the model wrote instead of calling a tool', () => {
+    // Such a turn ends with `finish: stop`, so no tool call exists: the model
+    // narrated its intent as markup. Showing that verbatim put tag syntax in the
+    // transcript, which is what this projection prevents.
+    const events = new Projector().push({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: `我先看一下。${MARKUP}` }] },
+    }).events
+    const assistant = events.find(event => event.kind === 'assistant')
+    expect(assistant?.blocks).toEqual([{ type: 'text', text: '我先看一下。' }])
+    expect(JSON.stringify(events)).not.toContain('｜DSML｜')
+    // The fact that something was removed stays observable.
+    expect(events.some(event => event.kind === 'diagnostic' && event.code === 'INLINE_TOOL_MARKUP')).toBe(true)
+  })
+
+  it('emits no text block when the message was only markup', () => {
+    const events = new Projector().push({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: MARKUP }] },
+    }).events
+    expect(events.some(event => event.kind === 'assistant')).toBe(false)
+    expect(JSON.stringify(events)).not.toContain('invoke')
+  })
+
+  it('leaves a structured tool call untouched', () => {
+    // The stripping must not interfere with the normal path: a real `tool_use`
+    // still becomes a tool-call block plus its call row.
+    const events = new Projector().push({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'running it' },
+          { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } },
+        ],
+      },
+    }).events
+    const assistant = events.find(event => event.kind === 'assistant')
+    expect(assistant?.blocks).toContainEqual({ type: 'tool-call', id: 'toolu_1', name: 'Bash', arguments: '{"command":"ls"}' })
+    expect(events.some(event => event.kind === 'tool-call' && event.id === 'toolu_1')).toBe(true)
+  })
+})

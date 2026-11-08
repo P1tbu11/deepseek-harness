@@ -25,6 +25,10 @@ export interface CodeBuddySettings {
   readonly stateDir: string
   /** SIGTERM grace before the subprocess service escalates. */
   readonly graceMs: number
+  /** Context window published for every model this route serves, in tokens. */
+  readonly contextWindow: number
+  /** Output tokens reserved out of that window when the compaction planner sizes a switch. */
+  readonly maxOutputTokens: number
 }
 
 /**
@@ -46,6 +50,13 @@ export default class CodeBuddySettingsService extends Service {
     modelsTimeoutMs: z.number().min(100).default(8000),
     stateDir: z.string().default(''),
     graceMs: z.number().min(1).default(3000),
+    // CodeBuddy reports both numbers in `modelUsage` of every result frame; a
+    // live call against deepseek-v4.1-flash announced contextWindow 1000000 and
+    // maxOutputTokens 128000. These defaults match that build so an unmapped
+    // deployment still sizes compaction the way the CLI itself does; a profile
+    // pointing at a smaller backend lowers them.
+    contextWindow: z.number().min(1).default(1_000_000),
+    maxOutputTokens: z.number().min(1).default(128_000),
   })
 
   /**

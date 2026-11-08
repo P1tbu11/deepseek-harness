@@ -1,33 +1,128 @@
 {
   "messages": [
-    { "type": "system", "subtype": "init", "session_id": "cli-sess-1" },
-    { "type": "stream_event", "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "你" } } },
-    { "type": "stream_event", "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "好" } } },
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "cli-sess-1"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "delta": {
+          "type": "text_delta",
+          "text": "你"
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "delta": {
+          "type": "text_delta",
+          "text": "好"
+        }
+      }
+    },
     {
       "type": "assistant",
       "message": {
         "content": [
-          { "type": "text", "text": "你好" },
-          { "type": "thinking", "thinking": "look", "signature": "do-not-persist" },
-          { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "echo hi" } }
+          {
+            "type": "text",
+            "text": "你好"
+          },
+          {
+            "type": "thinking",
+            "thinking": "look",
+            "signature": "do-not-persist"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "Bash",
+            "input": {
+              "command": "echo hi"
+            }
+          }
         ],
-        "usage": { "input_tokens": 3, "output_tokens": 2 }
+        "usage": {
+          "input_tokens": 3,
+          "output_tokens": 2
+        }
       }
     },
     {
       "type": "user",
-      "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "hi\n" }] }
+      "message": {
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "hi\n"
+          }
+        ]
+      }
     },
     {
       "type": "assistant",
-      "message": { "content": [{ "type": "text", "text": "done ```js\nconst x = 1\n```" }] }
+      "message": {
+        "content": [
+          {
+            "type": "text",
+            "text": "done ```js\nconst x = 1\n```"
+          }
+        ]
+      }
     },
-    { "type": "result", "subtype": "success", "result": "done ```js\nconst x = 1\n```", "is_error": false }
+    {
+      "type": "result",
+      "subtype": "success",
+      "result": "done ```js\nconst x = 1\n```",
+      "is_error": false
+    }
   ],
   "expected": [
-    { "kind": "assistant", "blocks": [{ "type": "text", "text": "你好" }, { "type": "reasoning", "text": "look" }] },
-    { "kind": "tool-call", "id": "toolu_1", "name": "Bash", "arguments": "{\"command\":\"echo hi\"}" },
-    { "kind": "tool-result", "id": "toolu_1", "text": "hi\n", "isError": false },
-    { "kind": "assistant", "blocks": [{ "type": "text", "text": "done ```js\nconst x = 1\n```" }] }
+    {
+      "kind": "assistant",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "你好"
+        },
+        {
+          "type": "reasoning",
+          "text": "look"
+        },
+        {
+          "type": "tool-call",
+          "id": "toolu_1",
+          "name": "Bash",
+          "arguments": "{\"command\":\"echo hi\"}"
+        }
+      ]
+    },
+    {
+      "kind": "tool-call",
+      "id": "toolu_1",
+      "name": "Bash",
+      "arguments": "{\"command\":\"echo hi\"}"
+    },
+    {
+      "kind": "tool-result",
+      "id": "toolu_1",
+      "text": "hi\n",
+      "isError": false
+    },
+    {
+      "kind": "assistant",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "done ```js\nconst x = 1\n```"
+        }
+      ]
+    }
   ]
 }

@@ -149,16 +149,32 @@ const USAGE_FIELDS = {
  *
  * The CLI reports the same counters in several frames that supersede one
  * another, so later values overwrite earlier ones instead of accumulating.
+ *
+ * `input_tokens` is reduced to its uncached part. The CLI folds cache reads
+ * into that total (a live call reported 30513 alongside 30336 cached, leaving
+ * 177 uncached), while the harness requires the counters to be disjoint and
+ * sums them for its context gauge. Keeping the total double-counted the prompt.
  * @param target - the running usage value.
  * @param raw - a provider usage object.
  */
 function readUsage(target: TokenUsage, raw: unknown): void {
   const usage = record(raw)
   if (usage === undefined) return
+  const counters: Record<string, number> = {}
   for (const [wire, local] of Object.entries(USAGE_FIELDS)) {
     const value = usage[wire]
-    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) target[local] = value
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) counters[local] = value
   }
+  if (counters.outputTokens !== undefined) target.outputTokens = counters.outputTokens
+  const cacheRead = counters.cacheReadTokens ?? 0
+  const cacheWrite = counters.cacheWriteTokens ?? 0
+  if (counters.inputTokens !== undefined) {
+    // Clamped: a proxy reporting cache counters without folding them in would
+    // otherwise produce a negative count and a NaN ratio downstream.
+    target.inputTokens = Math.max(0, counters.inputTokens - cacheRead - cacheWrite)
+  }
+  if (counters.cacheReadTokens !== undefined) target.cacheReadTokens = cacheRead
+  if (counters.cacheWriteTokens !== undefined) target.cacheWriteTokens = cacheWrite
 }
 
 /** Map the CLI's stop reason onto the harness vocabulary. */
@@ -333,6 +349,7 @@ export class CliStream {
     this.settled = true
     if (this.failed !== undefined) throw new LlmError(this.failed, 'CODEBUDDY_ONE_SHOT')
     if (!this.textSeen) throw new LlmError('CodeBuddy one-shot call returned no content', 'EMPTY_RESPONSE')
+    // Every counter is disjoint here, so the total is their plain sum.
     this.usage.totalTokens = this.usage.inputTokens + this.usage.outputTokens
       + (this.usage.cacheReadTokens ?? 0) + (this.usage.cacheWriteTokens ?? 0)
     return [

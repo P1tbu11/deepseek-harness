@@ -7,32 +7,18 @@ import type CodeBuddySettingsService from './settings.ts'
 import { discoverModels, type ModelCatalog } from './models.ts'
 
 /**
- * Context capacity advertised for every model this route serves.
+ * Fallback context capacity, used only when a profile supplies none.
  *
- * The CLI hides which backend model a given id resolves to, so the plugin
- * cannot read a per-model window from the CLI. It must still publish one:
- * the session-controller compares a conversation's size against the target
- * model's window before it switches models, and an adapter that reports no
- * capacity fails that switch outright rather than being treated as generous.
- *
- * 1,048,576 matches what the official DeepSeek listing declares for the models
- * the CLI is normally pointed at, and it is the conservative choice against a
- * larger unknown window: too small compacts earlier than necessary, while too
- * large lets a request overflow. A deployment whose CLI runs a smaller model
- * must lower this through settings.
+ * CodeBuddy publishes both numbers in `modelUsage` of every result frame; a live
+ * call against `deepseek-v4.1-flash` announced `contextWindow: 1000000` and
+ * `maxOutputTokens: 128000`. The deployment setting is preferred because it can
+ * follow whatever backend the CLI is pointed at, while this keeps an unconfigured
+ * plugin sized like the build it normally runs.
  */
-const CODEBUDDY_CONTEXT_WINDOW = 1_048_576
+const FALLBACK_CONTEXT_WINDOW = 1_000_000
 
-/**
- * Output tokens reserved out of {@link CODEBUDDY_CONTEXT_WINDOW} when the
- * compaction planner sizes a switch.
- *
- * The CLI owns its own completion budget, so this is not enforced by the
- * adapter; it only stops the planner from treating the whole window as free
- * input space. 8,192 is a typical coding-agent answer and leaves the rest of a
- * large window usable.
- */
-const CODEBUDDY_DEFAULT_MAX_TOKENS = 8_192
+/** Fallback completion reserve, matching the same build's announced maximum. */
+const FALLBACK_MAX_OUTPUT_TOKENS = 128_000
 
 /**
  * Publish `codebuddy` on the existing provider catalog.
@@ -123,8 +109,8 @@ class CodeBuddyCatalog extends LlmAdapter {
   }> {
     const catalog = await this.catalog()
     const capacity = {
-      context: { contextWindow: CODEBUDDY_CONTEXT_WINDOW },
-      defaultMaxTokens: CODEBUDDY_DEFAULT_MAX_TOKENS,
+      context: { contextWindow: this.settings.config.contextWindow || FALLBACK_CONTEXT_WINDOW },
+      defaultMaxTokens: this.settings.config.maxOutputTokens || FALLBACK_MAX_OUTPUT_TOKENS,
     }
     if (model === DEFAULT_MODEL_ID) {
       const configured = catalog.configured

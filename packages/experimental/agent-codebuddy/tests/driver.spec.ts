@@ -24,14 +24,37 @@ import CodeBuddySettings from '../src/settings.ts'
 
 const fixture = fileURLToPath(new URL('./fixtures/cli.mjs', import.meta.url))
 
+/**
+ * Stands in for the native DeepSeek route.
+ *
+ * Registered under two provider ids so a switch can land on a provider that is
+ * deliberately *not* `codebuddy`: that is the case this plugin must route
+ * natively instead of forwarding to the CLI.
+ */
 class MockAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
+  override providerInfo(provider: string) { return { id: provider, name: 'Native' } }
+  override async resolveModel(provider: string, model: string) {
+    return {
+      provider, id: model, name: model,
+      inputModalities: ['text'] as const,
+      context: { contextWindow: 1_000_000 },
+      defaultMaxTokens: 8_192,
+    }
+  }
+  override async listModels(provider: string) {
+    return [
+      { provider, id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash' },
+      { provider, id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+    ]
+  }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push(options)
-    const text = 'deepseek-ok'
+    const text = 'native-ok'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text }
     yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'usage', usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
@@ -68,7 +91,7 @@ async function harness(config: Record<string, unknown>) {
     return Promise.resolve('allowed-once')
   })
   const adapter = new MockAdapter()
-  ctx.llm.registerAdapter(['mock'], adapter)
+  ctx.llm.registerAdapter(['mock', 'deepseek-account'], adapter)
   await ctx.plugin(CodeBuddySettings, { stateDir: dir, ...config })
   await ctx.plugin(CodeBuddyLoop, { agents: [] })
   return {
@@ -335,7 +358,7 @@ describe('DeepSeek sessions and profile shape', () => {
     })
     handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
     await handle.agent.whenIdle()
-    expect(texts(handle.agent)).toEqual(['deepseek-ok'])
+    expect(texts(handle.agent)).toEqual(['native-ok'])
     expect(started.adapter.requests).toHaveLength(1)
     expect(started.ctx.tools.executable('plugin_manager')).toBeDefined()
     expect(started.ctx.llm.listProviders().map(provider => provider.id)).toContain('codebuddy')
@@ -519,23 +542,75 @@ describe('DeepSeek sessions and profile shape', () => {
     await expect(readFile(join(dir, 'argv.log'), 'utf8')).rejects.toThrow()
   })
 
-  it('explains a foreign model selection instead of failing inside the CLI', async () => {
-    const { agent } = await bootCodeBuddy('chat')
+  it('routes a foreign model selection to a native turn instead of the CLI', async () => {
+    const { agent, dir, ctx, adapter } = await bootCodeBuddy('native')
     agent.model.select({ provider: 'deepseek-account', model: 'deepseek-flash' })
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
     await agent.whenIdle()
-    const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
-    expect(end?.type === 'turn/end' ? end.data.reason : {}).toMatchObject({
-      kind: 'error',
-      error: { code: 'UNSUPPORTED_MODEL' },
-    })
-    const reason = end?.type === 'turn/end' && end.data.reason.kind === 'error' ? end.data.reason.error.message : ''
-    // The message names both the refused route and the way out, and carries no
-    // gateway payload: no provider model list may leak into the transcript.
-    expect(reason).toContain('deepseek-account/deepseek-flash')
-    expect(reason).toContain('Select a CodeBuddy model')
-    expect(reason).not.toContain('Currently supported models')
-    expect(reason).not.toContain('claude-sonnet')
+    // No CLI process: the turn took the native route. This is what makes a
+    // mid-session switch quiet rather than a gateway 400.
+    await expect(readFile(join(dir, 'argv.log'), 'utf8')).rejects.toThrow()
+    // The native adapter actually answered, through the same Session.
+    expect(texts(agent)).toContain('native-ok')
+    expect(adapter.requests.at(-1)).toMatchObject({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    expect(ctx).toBeDefined()
+  })
+
+  it('keeps the conversation across a CLI-to-native-to-CLI switch', async () => {
+    const { agent } = await bootCodeBuddy('chat')
+    const sent = (text: string) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+    // Start on the CLI.
+    agent.followup(sent('first on cli'))
+    await agent.whenIdle()
+    const afterCli = agent.session.snapshotEvents().filter(event => event.type === 'assistant/message').length
+    expect(afterCli).toBeGreaterThan(0)
+    // Switch to the native route and keep talking.
+    agent.model.select({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    agent.followup(sent('second native'))
+    await agent.whenIdle()
+    // Switch back to the CLI in the same Session.
+    agent.model.select({ provider: 'codebuddy', model: 'gemini-3.1-pro' })
+    agent.followup(sent('third on cli again'))
+    await agent.whenIdle()
+    const events = agent.session.snapshotEvents()
+    const assistant = events.filter(event => event.type === 'assistant/message')
+    // One continuous log: three user turns, three assistant answers, no reset.
+    expect(assistant.length).toBeGreaterThanOrEqual(3)
+    expect(assistant.some(event => event.type === 'assistant/message'
+      && event.data.message.source.provider === 'deepseek-account')).toBe(true)
+    expect(assistant.some(event => event.type === 'assistant/message'
+      && event.data.message.source.provider === 'codebuddy')).toBe(true)
+    // Every turn closed, so the UI never sees a stuck turn.
+    expect(events.filter(event => event.type === 'turn/end')).toHaveLength(3)
+    // The history the native turn saw included what the CLI wrote.
+    expect(JSON.stringify(events.filter(event => event.type === 'user/message'))).toContain('first on cli')
+  })
+  it('carries the tool call in the assistant message so a later native turn can pair it', async () => {
+    // `tool/result` is a surface event and projects into the model-visible
+    // history, while `tool/call` is not. A call recorded ONLY as its own event
+    // therefore leaves the following result orphaned, and a native turn reading
+    // that history fails DeepSeek's serializer with "tool result has no matching
+    // call" — the exact failure a CLI turn followed by a switch produced.
+    const { agent } = await bootCodeBuddy('chat')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'use a tool' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const events = agent.session.snapshotEvents()
+    const calls = events.filter(event => event.type === 'tool/call')
+    expect(calls.length).toBeGreaterThan(0)
+    const callIds = new Set(calls.flatMap(event => event.type === 'tool/call' ? [event.data.callId] : []))
+    // Every call id must also appear as a block inside an assistant message.
+    const inMessages = new Set(events.flatMap((event) => {
+      if (event.type !== 'assistant/message') return []
+      return event.data.message.content.flatMap(block => block.type === 'tool-call' ? [block.id] : [])
+    }))
+    for (const id of callIds) expect(inMessages.has(id)).toBe(true)
+    // And every tool result names a call that some assistant message carries.
+    const results = events.filter(event => event.type === 'tool/result')
+    expect(results.length).toBeGreaterThan(0)
+    for (const result of results) {
+      if (result.type !== 'tool/result') continue
+      expect(inMessages.has(result.data.message.source.callId)).toBe(true)
+    }
   })
 })
 

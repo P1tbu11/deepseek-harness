@@ -1,4 +1,6 @@
+import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import { BRIDGE_SERVER } from './constants.ts'
+import { stripInlineToolCalls } from './dsml.ts'
 
 /** One NDJSON object from the CLI stdout stream. */
 export type ProtocolMessage = Readonly<Record<string, unknown>>
@@ -23,7 +25,7 @@ export type Projected =
   | { readonly kind: 'assistant'; readonly blocks: readonly AssistantOut[] }
   | { readonly kind: 'tool-call'; readonly id: string; readonly name: string; readonly arguments: string }
   | { readonly kind: 'tool-result'; readonly id: string; readonly text: string; readonly isError: boolean }
-  | { readonly kind: 'usage'; readonly inputTokens: number; readonly outputTokens: number }
+  | { readonly kind: 'usage'; readonly usage: TokenUsage }
   | { readonly kind: 'result'; readonly text: string; readonly isError: boolean }
   | { readonly kind: 'diagnostic'; readonly code: string; readonly detail: string }
 
@@ -31,6 +33,7 @@ export type Projected =
 export type AssistantOut =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'reasoning'; readonly text: string }
+  | { readonly type: 'tool-call'; readonly id: string; readonly name: string; readonly arguments: string }
 
 /** A block the CLI streams token by token, and the text accumulated so far. */
 interface LiveBlock {
@@ -219,30 +222,48 @@ export class Projector {
           events.push(diagnostic('UNKNOWN_BLOCK', 'assistant content block is not an object'))
           continue
         }
-        if (item.type === 'text' && typeof item.text === 'string') blocks.push({ type: 'text', text: item.text })
+        if (item.type === 'text' && typeof item.text === 'string') {
+          // A model occasionally writes its tool intent as inline markup instead
+          // of using the structured channel; strip it so the transcript shows
+          // prose rather than tag syntax. The diagnostic records that this
+          // happened, so the frequency stays observable even when prose survives.
+          const text = stripInlineToolCalls(item.text)
+          if (text !== item.text) {
+            events.push(diagnostic('INLINE_TOOL_MARKUP', 'stripped inline tool markup from assistant text'))
+          }
+          if (text !== '') blocks.push({ type: 'text', text })
+        }
         else if (item.type === 'thinking' && typeof item.thinking === 'string') blocks.push({ type: 'reasoning', text: item.thinking })
         else if (item.type === 'redacted_thinking') events.push(diagnostic('REDACTED_THINKING', 'redacted thinking was not copied'))
         else if (item.type === 'tool_use') {
-          if (blocks.length > 0) {
-            events.push({ kind: 'assistant', blocks: [...blocks] })
-            blocks.length = 0
-            this.resetLive()
-          }
-          events.push(...this.toolUse(item))
+          // The assistant message CARRIES the tool call, exactly as `agent-loop`
+          // records one (`live.blocks()` includes tool-call blocks). This is not
+          // cosmetic: `tool/result` is a surface event and projects into the
+          // model-visible history, while `tool/call` is not, so a call recorded
+          // only as its own event leaves the following result orphaned. A native
+          // turn then fails DeepSeek's serializer with "tool result has no
+          // matching call" the moment it reads that history.
+          const call = this.toolUse(item)
+          if (call.blocks !== undefined) blocks.push(call.blocks)
+          events.push(...call.projected)
         }
         else if (item.type === 'image') events.push(diagnostic('IMAGE_OMITTED', 'assistant image bytes were not copied'))
         else events.push(diagnostic('UNKNOWN_BLOCK', `assistant block "${String(item.type)}"`))
       }
     }
     if (blocks.length > 0) {
-      events.push({ kind: 'assistant', blocks })
+      events.unshift({ kind: 'assistant', blocks })
     }
     // One `assistant` frame closes one CLI message, whether or not it carried
     // text: its streamed blocks are now durable, and the next round numbers its
     // blocks from 0 again.
     this.resetLive()
+    // Usage is emitted BEFORE the blocks it prices: the driver commits the
+    // assistant message as soon as it sees that projection, so a later usage
+    // event would arrive after the message had already been written without it,
+    // leaving every CLI turn's usage empty.
     const usage = usageOf(body?.usage)
-    if (usage !== undefined) events.push({ kind: 'usage', ...usage })
+    if (usage !== undefined) events.unshift({ kind: 'usage', usage })
     return events
   }
 
@@ -276,18 +297,34 @@ export class Projector {
     return blocks.some(block => block.type === 'text') ? blocks : []
   }
 
-  private toolUse(item: ProtocolMessage): Projected[] {
+  /**
+   * Read one `tool_use` block as both a message block and its presentation event.
+   *
+   * The block goes into the assistant message so the model-visible history pairs
+   * it with the `tool/result` that follows; the event tells the driver to record
+   * that call row. Both are needed, and they are produced together so a caller
+   * cannot take one without the other.
+   * @param item - the CLI `tool_use` content block.
+   * @returns the assistant block and the tool-call projection.
+   */
+  private toolUse(item: ProtocolMessage): {
+    blocks?: Extract<AssistantOut, { type: 'tool-call' }>
+    projected: Projected[]
+  } {
     const id = typeof item.id === 'string' ? item.id : ''
     const name = typeof item.name === 'string' ? item.name : ''
-    if (id === '' || name === '') return [diagnostic('MALFORMED_TOOL', 'tool_use is missing id or name')]
+    if (id === '' || name === '') return { projected: [diagnostic('MALFORMED_TOOL', 'tool_use is missing id or name')] }
     this.openTools.add(id)
     let args = ''
     try {
       args = JSON.stringify(item.input ?? {})
     } catch {
-      return [diagnostic('MALFORMED_TOOL', `tool_use "${id}" input is not JSON`)]
+      return { projected: [diagnostic('MALFORMED_TOOL', `tool_use "${id}" input is not JSON`)] }
     }
-    return [{ kind: 'tool-call', id, name, arguments: args }]
+    return {
+      blocks: { type: 'tool-call', id, name, arguments: args },
+      projected: [{ kind: 'tool-call', id, name, arguments: args }],
+    }
   }
 
   private user(message: ProtocolMessage): Projected[] {
@@ -377,13 +414,60 @@ function toolResultText(content: unknown): string {
   }).join('')
 }
 
-function usageOf(value: unknown): { inputTokens: number; outputTokens: number } | undefined {
+/**
+ * Wire field to harness field for every token counter the two vocabularies share.
+ *
+ * The CLI and the harness name the same four numbers; only the spelling of the
+ * cache counters differs.
+ */
+export const USAGE_FIELDS = {
+  input_tokens: 'inputTokens',
+  output_tokens: 'outputTokens',
+  cache_read_input_tokens: 'cacheReadTokens',
+  cache_creation_input_tokens: 'cacheWriteTokens',
+} as const
+
+/**
+ * Copy one CLI usage object onto the harness vocabulary.
+ *
+ * Two corrections make the numbers mean what the harness expects.
+ *
+ * 1. The cache counters are carried over at all. Reading only input/output
+ *    threw them away, so a CLI-driven Session reported no cache hit rate even
+ *    though the CLI sends it in every assistant frame.
+ *
+ * 2. `input_tokens` is reduced to its uncached part. The CLI follows the
+ *    Messages convention and folds cache reads into that total — a live call
+ *    reported `input_tokens: 30513` beside `cache_read_input_tokens: 30336`,
+ *    where 30513 − 30336 = 177 is the uncached input, the same 177 the CLI
+ *    publishes as `modelUsage.inputTokens`. The harness requires the three
+ *    counters to be disjoint, and its context gauge sums them, so leaving the
+ *    total in place double-counted the prompt and halved the hit rate.
+ * @param value - a provider usage object from any frame that carries one.
+ * @returns the disjoint harness usage, or undefined when nothing was reported.
+ */
+function usageOf(value: unknown): TokenUsage | undefined {
   const usage = record(value)
   if (usage === undefined) return undefined
-  const input = numberField(usage, 'input_tokens')
-  const output = numberField(usage, 'output_tokens')
-  if (input === undefined || output === undefined) return undefined
-  return { inputTokens: input, outputTokens: output }
+  const counters: Record<string, number> = {}
+  for (const [wire, local] of Object.entries(USAGE_FIELDS)) {
+    const counter = numberField(usage, wire)
+    if (counter !== undefined) counters[local] = counter
+  }
+  const output = counters.outputTokens
+  const rawInput = counters.inputTokens
+  if (output === undefined || rawInput === undefined) return undefined
+  const cacheRead = counters.cacheReadTokens ?? 0
+  const cacheWrite = counters.cacheWriteTokens ?? 0
+  return {
+    // Clamped: a proxy that reports cache counters without folding them in
+    // would otherwise produce a negative input count and a NaN ratio downstream.
+    inputTokens: Math.max(0, rawInput - cacheRead - cacheWrite),
+    outputTokens: output,
+    totalTokens: rawInput + output,
+    ...cacheRead === 0 ? {} : { cacheReadTokens: cacheRead },
+    ...cacheWrite === 0 ? {} : { cacheWriteTokens: cacheWrite },
+  }
 }
 
 function numberField(message: ProtocolMessage, key: string): number | undefined {

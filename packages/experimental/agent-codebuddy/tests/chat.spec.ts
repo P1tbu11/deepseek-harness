@@ -201,7 +201,12 @@ describe('streamOneShot', () => {
       { type: 'reasoning', text: 'plan' },
       { type: 'text', text: 'answer from prompt' },
     ])
-    expect(assembler.usage).toMatchObject({ inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 })
+    // The fixture reports input_tokens 11 with cache_read 2, the Messages shape
+    // where the total already contains the cache. The harness keeps counters
+    // disjoint, so the uncached input is 11 − 2 = 9 and the context gauge
+    // (9 + 2) still totals the 11 the provider counted.
+    expect(assembler.usage).toMatchObject({ inputTokens: 9, outputTokens: 3, cacheReadTokens: 2 })
+    expect(assembler.usage?.totalTokens).toBe(14)
     expect(assembler.finish).toEqual({ kind: 'stop' })
     expect(settings.config.enabled).toBe(true)
   })
