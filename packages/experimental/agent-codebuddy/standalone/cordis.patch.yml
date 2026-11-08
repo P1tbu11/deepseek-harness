@@ -4,7 +4,7 @@
   disabled: true
 - insert:
     - id: agent-codebuddy-settings
-      name: '@p1tbu11/dsh-agent-codebuddy/settings'
+      name: '@hughxzhang/dsh-agent-codebuddy/settings'
       config:
         enabled: false
         command: ''
@@ -15,4 +15,4 @@
         modelsTimeoutMs: 8000
         stateDir: ''
     - id: agent-codebuddy
-      name: '@p1tbu11/dsh-agent-codebuddy'
+      name: '@hughxzhang/dsh-agent-codebuddy'

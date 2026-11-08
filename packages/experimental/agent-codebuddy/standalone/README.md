@@ -72,17 +72,26 @@ candidate within the same line is compatible, while an older one is not.
 
 ## Name
 
-This directory publishes as `@p1tbu11/dsh-agent-codebuddy`, not under the
+This directory publishes as `@hughxzhang/dsh-agent-codebuddy`, not under the
 project's own `@deepseek-ai/` scope. The parent workspace package keeps
 `@deepseek-ai/dsh-agent-codebuddy` for the official release; a redistributable
 copy must not claim a name its maintainer cannot publish.
 
 ## Install
 
-From npm, once published:
+From npm. The package currently carries both `next` and `latest`, the latter set
+by npm when the name was first claimed, so a bare install also resolves. Pin the
+tag or the exact version anyway: a deployment that must not drift onto a later
+prerelease should not depend on where `latest` happens to point.
 
 ```sh
-dsh plugin --profile <profile> add "@p1tbu11/dsh-agent-codebuddy"
+dsh plugin --profile <profile> add "@hughxzhang/dsh-agent-codebuddy@next"
+```
+
+Pin the exact version instead when a deployment must be reproducible:
+
+```sh
+dsh plugin --profile <profile> add "@hughxzhang/dsh-agent-codebuddy@0.2.2-rc.2"
 ```
 
 From a Git repository, with the package directory inside it:
@@ -127,7 +136,7 @@ node packages/experimental/agent-codebuddy/standalone/sync.mjs
 ```
 
 The `pnpm --filter` name is the **parent** workspace package, which keeps the
-`@deepseek-ai/` scope; this directory publishes as `@p1tbu11/dsh-agent-codebuddy`
+`@deepseek-ai/` scope; this directory publishes as `@hughxzhang/dsh-agent-codebuddy`
 instead, so the two never collide in the registry.
 
 `sync.mjs` copies `lib/index.js` and the `settings` entry into `dist/`.
