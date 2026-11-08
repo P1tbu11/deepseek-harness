@@ -31,7 +31,7 @@ describe('synthetic stream projection', () => {
     const events = golden.messages.flatMap((message) => {
       const projected = projector.push(message)
       expect(projected.fault).toBeUndefined()
-      return projected.events.filter(event => event.kind !== 'live-text' && event.kind !== 'usage' && event.kind !== 'diagnostic' && event.kind !== 'session' && event.kind !== 'result')
+      return projected.events.filter(event => event.kind !== 'live-chunk' && event.kind !== 'usage' && event.kind !== 'diagnostic' && event.kind !== 'session' && event.kind !== 'result')
     })
     expect(events).toEqual(golden.expected)
     expect(JSON.stringify(events)).not.toContain('do-not-persist')

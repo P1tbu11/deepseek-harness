@@ -112,6 +112,14 @@ export interface ModelCatalog {
   readonly models: readonly string[]
   /** Model the CLI uses when the harness passes no `--model`. */
   readonly configured: string
+  /**
+   * Whether the CLI ships the `ViewImage` tool.
+   *
+   * Builds before 2.174 do not have it: a session on 2.129 reports 91 tools with
+   * no `ViewImage`, while 2.174 reports 69 that include it. The prompt names the
+   * tool so the model opens the staged image, so this decides whether it may.
+   */
+  readonly viewImage: boolean
 }
 
 const cache = new Map<string, ModelCatalog>()
@@ -134,7 +142,12 @@ export async function discoverModels(ctx: Context, input: {
 
   const configured = await readConfiguredModel(input.settingsPath)
   const models = await readHelpModels(ctx, input.command, input.args, input.timeoutMs)
-  const result: ModelCatalog = { models: models.length > 0 ? models : BUILTIN_MODELS, configured }
+  const viewImage = await readViewImageSupport(ctx, input.command, input.args, input.timeoutMs)
+  const result: ModelCatalog = {
+    models: models.length > 0 ? models : BUILTIN_MODELS,
+    configured,
+    viewImage,
+  }
   cache.set(key, result)
   return result
 }
@@ -178,4 +191,114 @@ async function readHelpModels(
   const stdout = collected.stdout?.readFrom(0).text ?? ''
   const stderr = collected.stderr?.readFrom(0).text ?? ''
   return parseSupportedModels(`${stdout}\n${stderr}`)
+}
+
+/** Tool name the CLI's image reader is registered under. */
+const VIEW_IMAGE_TOOL = 'ViewImage'
+
+/**
+ * Detect whether the installed CLI ships `ViewImage`.
+ *
+ * The help text cannot answer this: 2.129 and 2.174 print byte-identical
+ * `--help`, and neither lists tool names. A build's tool inventory is only
+ * published in the `system`/`init` line of a live stream-json session, emitted
+ * once the CLI has a prompt to answer. So this opens a throwaway session, sends
+ * a one-word prompt, reads that line, and stops the process before it can spend
+ * a model call — the tool list arrives before the first request is dispatched.
+ *
+ * A CLI that fails to start, or never reaches `init`, reports no support: the
+ * staged path is then announced without naming a tool, which every build can
+ * still open with `Read`.
+ * @param ctx - context whose subprocess service owns the child process.
+ * @param command - absolute CLI path.
+ * @param args - fixed arguments configured for the CLI.
+ * @param timeoutMs - deadline for the whole probe.
+ * @returns whether `ViewImage` appears in the CLI's tool list.
+ */
+async function readViewImageSupport(
+  ctx: Context,
+  command: string,
+  args: readonly string[],
+  timeoutMs: number,
+): Promise<boolean> {
+  let handle
+  try {
+    handle = ctx.subprocess.spawn({
+      argv: [command, ...args, ...launchProbeArgs()],
+      cwd: process.cwd(),
+      stdio: {
+        stdin: 'pipe',
+        stdout: { maxBytes: 8 << 20 },
+        stderr: { maxBytes: 1 << 20 },
+      },
+      graceMs: 1000,
+      // Lets a test fixture tell this probe apart from a real turn launch.
+      env: { ...process.env, CODEBUDDY_PROBE_TOKEN: '1' },
+    })
+  } catch {
+    return false
+  }
+  const write = (value: unknown): void => {
+    try {
+      handle?.stdin?.write(`${JSON.stringify(value)}\n`)
+    } catch {
+      /* a stopped CLI closes stdin; the probe then reports no support */
+    }
+  }
+  const timer = setTimeout(() => { handle?.terminate() }, timeoutMs)
+  try {
+    write({
+      type: 'control_request',
+      request_id: 'probe-init',
+      request: { subtype: 'initialize', hooks: {}, hasPrompt: true, capabilities: { askUserQuestion: true } },
+    })
+    // `init` is only emitted once a prompt exists, so send one. The process is
+    // stopped as soon as the tool list arrives, which is before the request is
+    // dispatched, so the probe never spends a model call.
+    const kickoff = setTimeout(() => write({ type: 'user', message: { role: 'user', content: 'hi' } }), 100)
+    try {
+      for (;;) {
+        if (parseToolList(handle.collected.stdout?.readFrom(0).text ?? '')) return true
+        const outcome = await Promise.race([
+          handle.done.then(() => 'exited' as const),
+          new Promise<'tick'>(resolve => setTimeout(() => resolve('tick'), 50)),
+        ])
+        if (outcome === 'exited') return false
+      }
+    } finally {
+      clearTimeout(kickoff)
+    }
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+    handle.terminate()
+  }
+}
+
+/** Arguments that make the CLI speak stream-json for a tool-list probe. */
+function launchProbeArgs(): readonly string[] {
+  return ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions']
+}
+
+/**
+ * Read the tool list out of a stream-json transcript.
+ * @param text - everything the CLI printed.
+ * @returns whether `ViewImage` is among the advertised tools.
+ */
+export function parseToolList(text: string): boolean {
+  for (const line of text.split('\n')) {
+    if (line === '' || !line.includes(VIEW_IMAGE_TOOL)) continue
+    try {
+      const parsed: unknown = JSON.parse(line)
+      if (parsed === null || typeof parsed !== 'object') continue
+      const entry = parsed as { type?: unknown; subtype?: unknown; tools?: unknown }
+      if (entry.type !== 'system' || entry.subtype !== 'init') continue
+      if (!Array.isArray(entry.tools)) continue
+      return entry.tools.includes(VIEW_IMAGE_TOOL)
+    } catch {
+      /* not a JSON line */
+    }
+  }
+  return false
 }

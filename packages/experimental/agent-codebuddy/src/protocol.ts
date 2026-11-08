@@ -3,10 +3,23 @@ import { BRIDGE_SERVER } from './constants.ts'
 /** One NDJSON object from the CLI stdout stream. */
 export type ProtocolMessage = Readonly<Record<string, unknown>>
 
+/**
+ * One live chunk of the model's own token stream.
+ *
+ * Every `stream_event` carries the index of the content block its delta belongs
+ * to. Projecting that index rather than flattening everything onto block 0 keeps
+ * reasoning and answer text in separate blocks, so the client appends each delta
+ * to the block it belongs to while the reply is still arriving.
+ */
+export type LiveChunk =
+  | { readonly type: 'block-start'; readonly index: number; readonly blockType: 'text' | 'reasoning' }
+  | { readonly type: 'text-delta'; readonly index: number; readonly text: string }
+  | { readonly type: 'reasoning-delta'; readonly index: number; readonly text: string }
+
 /** What the driver commits. Payloads are the CLI's own text, ids, and arguments. */
 export type Projected =
   | { readonly kind: 'session'; readonly cliSessionId: string }
-  | { readonly kind: 'live-text'; readonly text: string }
+  | { readonly kind: 'live-chunk'; readonly chunk: LiveChunk }
   | { readonly kind: 'assistant'; readonly blocks: readonly AssistantOut[] }
   | { readonly kind: 'tool-call'; readonly id: string; readonly name: string; readonly arguments: string }
   | { readonly kind: 'tool-result'; readonly id: string; readonly text: string; readonly isError: boolean }
@@ -18,6 +31,12 @@ export type Projected =
 export type AssistantOut =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'reasoning'; readonly text: string }
+
+/** A block the CLI streams token by token, and the text accumulated so far. */
+interface LiveBlock {
+  readonly type: 'text' | 'reasoning'
+  text: string
+}
 
 /** Fatal protocol condition. `detail` never includes the raw object. */
 export interface ProtocolFault {
@@ -80,8 +99,15 @@ export function initializeRequest(creator: boolean): Record<string, unknown> {
 export class Projector {
   private sawResult = false
   private readonly openTools = new Set<string>()
-  /** Live deltas already represented by a committed assistant message. */
-  liveText = ''
+  /**
+   * Streamable blocks the CLI has opened, by its own content-block index.
+   *
+   * A `stream_event` carries the index of the block its delta belongs to, so the
+   * map is what decides whether a delta extends a text block or a reasoning one.
+   * A block whose type cannot stream (a tool call) is recorded with a null type
+   * so its later deltas are not mistaken for text.
+   */
+  private readonly blocks = new Map<number, LiveBlock | null>()
 
   /**
    * Project one message.
@@ -123,11 +149,61 @@ export class Projector {
 
   private stream(message: ProtocolMessage): Projected[] {
     const event = record(message.event)
-    const delta = event === undefined ? undefined : record(event.delta)
-    const text = delta?.type === 'text_delta' && typeof delta.text === 'string' ? delta.text : undefined
-    if (text === undefined) return [diagnostic('IGNORED_EVENT', 'stream_event')]
-    this.liveText += text
-    return [{ kind: 'live-text', text }]
+    if (event === undefined) return [diagnostic('IGNORED_EVENT', 'stream_event')]
+    switch (event.type) {
+      case 'content_block_start': {
+        // A build that numbers its blocks is followed exactly; one that does
+        // not gets a single implicit text block, which is what its stream is.
+        const index = blockIndex(event.index) ?? 0
+        const type = record(event.content_block)?.type
+        const blockType = type === 'text' ? 'text' : type === 'thinking' ? 'reasoning' : undefined
+        // Record the block either way: a tool call streams no text, and an
+        // unrecorded index would let its deltas fall through as unknown.
+        if (blockType === undefined) {
+          this.blocks.set(index, null)
+          return [diagnostic('IGNORED_EVENT', `stream_event/content_block_start/${String(type)}`)]
+        }
+        this.blocks.set(index, { type: blockType, text: '' })
+        return [{ kind: 'live-chunk', chunk: { type: 'block-start', index, blockType } }]
+      }
+      case 'content_block_delta': {
+        const delta = record(event.delta)
+        if (delta === undefined) return [diagnostic('IGNORED_EVENT', 'stream_event/content_block_delta')]
+        const text = delta.type === 'text_delta' && typeof delta.text === 'string' ? delta.text : undefined
+        const thinking = delta.type === 'thinking_delta' && typeof delta.thinking === 'string' ? delta.thinking : undefined
+        if (text === undefined && thinking === undefined) {
+          return [diagnostic('IGNORED_EVENT', `stream_event/content_block_delta/${String(delta.type)}`)]
+        }
+        const index = blockIndex(event.index) ?? 0
+        // An unnumbered delta implies its own block: the CLI that sends bare
+        // deltas also sends no `content_block_start` to open them.
+        let open = this.blocks.get(index)
+        if (open === undefined) {
+          const implied: LiveBlock = { type: text === undefined ? 'reasoning' : 'text', text: '' }
+          this.blocks.set(index, implied)
+          open = implied
+        }
+        if (open === null) {
+          return [diagnostic('IGNORED_EVENT', `stream_event/content_block_delta/${index}`)]
+        }
+        if (text !== undefined && open.type === 'text') {
+          if (text === '') return []
+          open.text += text
+          return [{ kind: 'live-chunk', chunk: { type: 'text-delta', index, text } }]
+        }
+        if (thinking !== undefined && open.type === 'reasoning') {
+          if (thinking === '') return []
+          open.text += thinking
+          return [{ kind: 'live-chunk', chunk: { type: 'reasoning-delta', index, text: thinking } }]
+        }
+        return [diagnostic('IGNORED_EVENT', `stream_event/content_block_delta/${String(delta.type)}`)]
+      }
+      default:
+        // `message_start`, `message_delta`, and `message_stop` are accounting
+        // only: the harness takes usage from the assistant message and closes
+        // the block when the assistant message lands.
+        return [diagnostic('IGNORED_EVENT', `stream_event/${String(event.type ?? '')}`)]
+    }
   }
 
   private assistant(message: ProtocolMessage): Projected[] {
@@ -150,7 +226,7 @@ export class Projector {
           if (blocks.length > 0) {
             events.push({ kind: 'assistant', blocks: [...blocks] })
             blocks.length = 0
-            this.liveText = ''
+            this.resetLive()
           }
           events.push(...this.toolUse(item))
         }
@@ -160,11 +236,44 @@ export class Projector {
     }
     if (blocks.length > 0) {
       events.push({ kind: 'assistant', blocks })
-      this.liveText = ''
     }
+    // One `assistant` frame closes one CLI message, whether or not it carried
+    // text: its streamed blocks are now durable, and the next round numbers its
+    // blocks from 0 again.
+    this.resetLive()
     const usage = usageOf(body?.usage)
     if (usage !== undefined) events.push({ kind: 'usage', ...usage })
     return events
+  }
+
+  /**
+   * Forget the live blocks a committed assistant message has taken over.
+   *
+   * The CLI restarts content-block numbering at 0 for each assistant message,
+   * so a retained map would attribute the next round's deltas to the previous
+   * round's blocks.
+   */
+  private resetLive(): void {
+    this.blocks.clear()
+  }
+
+  /**
+   * Turn whatever the CLI streamed into assistant blocks, for a build that
+   * never sent the closing `assistant` message.
+   *
+   * The streamed blocks are returned in the order the CLI opened them, with
+   * their accumulated text. A block the CLI opened but never filled is skipped:
+   * an empty answer is not worth a fabricated message.
+   * @returns the streamed blocks, or nothing when no text arrived.
+   */
+  private liveBlocks(): AssistantOut[] {
+    const blocks: AssistantOut[] = []
+    for (const block of this.blocks.values()) {
+      if (block === null || block.text === '') continue
+      blocks.push({ type: block.type, text: block.text })
+    }
+    // Reasoning is context, not an answer: the harness needs visible text.
+    return blocks.some(block => block.type === 'text') ? blocks : []
   }
 
   private toolUse(item: ProtocolMessage): Projected[] {
@@ -210,9 +319,10 @@ export class Projector {
     if (this.sawResult) return []
     this.sawResult = true
     const events: Projected[] = []
-    if (this.liveText !== '') {
-      events.push({ kind: 'assistant', blocks: [{ type: 'text', text: this.liveText }] })
-      this.liveText = ''
+    const live = this.liveBlocks()
+    if (live.length > 0) {
+      events.push({ kind: 'assistant', blocks: live })
+      this.resetLive()
     }
     const subtype = typeof message.subtype === 'string' ? message.subtype : ''
     const text = typeof message.result === 'string' ? message.result : ''
@@ -238,6 +348,15 @@ export function withoutDuplicateResultText(events: readonly Projected[], committ
 
 function diagnostic(code: string, detail: string): Projected {
   return { kind: 'diagnostic', code, detail }
+}
+
+/**
+ * Read a content-block index as the non-negative integer the CLI numbers with.
+ * @param value - the `index` field on a `stream_event`.
+ * @returns the index, or undefined when it is not a usable position.
+ */
+function blockIndex(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 function record(value: unknown): ProtocolMessage | undefined {

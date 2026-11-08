@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocess from '@deepseek-ai/dsh-subprocess-local'
 import {
-  BUILTIN_MODELS, clearModelCache, discoverModels, parseSupportedModels, readConfiguredModel,
+  BUILTIN_MODELS, clearModelCache, discoverModels, parseSupportedModels, parseToolList, readConfiguredModel,
 } from '../src/models.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -49,6 +49,35 @@ describe('parseSupportedModels', () => {
   it('ignores unrelated parentheses before the supported list', () => {
     const help = 'Usage: codebuddy (beta) --model <model> Currently supported: (a, b)'
     expect(parseSupportedModels(help)).toEqual(['a', 'b'])
+  })
+})
+
+describe('parseToolList', () => {
+  it('finds ViewImage in the init line of a stream-json transcript', () => {
+    const transcript = [
+      '{"type":"control_response","response":{"subtype":"success"}}',
+      '{"type":"system","subtype":"init","tools":["Bash","Read","ViewImage"],"model":"m"}',
+    ].join('\n')
+    expect(parseToolList(transcript)).toBe(true)
+  })
+
+  it('reports no support for a build whose inventory omits it', () => {
+    // 2.129.0 publishes 91 tools and none of them is ViewImage.
+    const transcript = '{"type":"system","subtype":"init","tools":["Bash","Read","Glob"],"model":"m"}'
+    expect(parseToolList(transcript)).toBe(false)
+  })
+
+  it('ignores tool names outside an init line', () => {
+    const transcript = [
+      '{"type":"system","subtype":"status","tools":["ViewImage"]}',
+      'ViewImage appears in prose only',
+    ].join('\n')
+    expect(parseToolList(transcript)).toBe(false)
+  })
+
+  it('treats an empty or unparsable transcript as no support', () => {
+    expect(parseToolList('')).toBe(false)
+    expect(parseToolList('not json\n{"type":"system","subtype":"init","tools":null}')).toBe(false)
   })
 })
 

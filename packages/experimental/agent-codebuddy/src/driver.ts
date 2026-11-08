@@ -5,7 +5,7 @@ import { AgentModel } from '@deepseek-ai/dsh-agent'
 import type { ModelSelectionProjectionState } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import type {
   AgentCancelCause, Session, UserMessage,
@@ -18,6 +18,7 @@ import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { handleBridgeCall, type McpCall } from './bridge.ts'
 import type { CliBinding } from './bindings.ts'
 import { BRIDGE_TOOL, CODEBUDDY_PROVIDER, CREATOR_PRESET, DEFAULT_MODEL_ID } from './constants.ts'
+import { discoverModels } from './models.ts'
 import {
   Projector, withoutDuplicateResultText, type ProtocolFault, type ProtocolMessage,
 } from './protocol.ts'
@@ -59,6 +60,8 @@ export function promptContent(
     readonly cwd: string
     readonly hostPath: (ref: ImageAttachmentRef) => string | undefined
     readonly link?: (target: string, path: string) => void
+    /** Whether the CLI ships `ViewImage`; false names no tool and leaves `Read`. */
+    readonly viewImage?: boolean
   },
 ): string {
   const blocks: readonly ContentBlock[] = message.content
@@ -75,6 +78,19 @@ export function promptContent(
         `UNSUPPORTED_INPUT: CodeBuddy cannot read image ${image.attachment.attachmentId}; it has no readable file on this host`,
       )
     }
+    // Fail here rather than link a path that is already gone.
+    //
+    // An attachment object can be pruned after the message was recorded. A link
+    // to it still lints as a symlink, so the turn starts, `ViewImage` answers
+    // ENOENT, and the model has no way to tell "wrong path" from "file removed":
+    // it retries with every other tool until the turn is killed, and the user
+    // sees a spinner and no answer. Refusing before the link is created turns
+    // that into one recorded error.
+    if (!existsSync(source)) {
+      throw new Error(
+        `UNSUPPORTED_INPUT: CodeBuddy cannot read image ${image.attachment.attachmentId}; its attachment object is gone from ${source}`,
+      )
+    }
     const extension = image.attachment.mediaType.split('/')[1] ?? 'png'
     // Name the link after the stored object, so the same image reached twice
     // in one session maps to one link instead of a new name per message.
@@ -86,9 +102,23 @@ export function promptContent(
     rmSync(path, { force: true })
     if (input.link !== undefined) input.link(source, path)
     else symlinkSync(source, path)
-    lines.push(`[image: ${IMAGE_STAGE_DIR}/${name}]`)
+    lines.push(describeImage(`${IMAGE_STAGE_DIR}/${name}`, input.viewImage !== false))
   }
   return [text, ...lines].filter(part => part !== '').join('\n')
+}
+
+/**
+ * One `[image: …]` line, phrased for the tools this CLI build provides.
+ *
+ * The staged path is what the model acts on. Naming `ViewImage` tells it which
+ * tool opens the image in a build that has one; a build without it is given the
+ * path alone, and the model reaches for `Read`, which reads image files too.
+ * @param line - the staged path, relative to the session directory.
+ * @param hasViewImage - whether the CLI advertises `ViewImage`.
+ * @returns the prompt line for one image.
+ */
+function describeImage(line: string, hasViewImage: boolean): string {
+  return hasViewImage ? `[image: ${line}]` : `[image file: ${line} — open it with Read]`
 }
 
 /**
@@ -131,6 +161,16 @@ export async function runCliTurn(input: {
   readonly signal: AbortSignal
   readonly onSession: (id: string) => Promise<void> | void
   readonly dispatch: AgentEventDispatch
+  /**
+   * Allocate the next assistant-stream revision.
+   *
+   * Every frame in one attached Agent lifecycle must carry the previous
+   * revision plus one, across turns and attempts: the Host keeps one dense
+   * stream per live Session and drops an attempt whose numbering breaks, and
+   * the Web client rejects a skipped revision as a lost carrier. Only a
+   * replacement may restart at 1.
+   */
+  readonly nextRevision: () => number
 }): Promise<void> {
   const session = input.session
   session.append('turn/start', { turn: input.turn })
@@ -162,7 +202,7 @@ export async function runCliTurn(input: {
   let resultError = false
   let step = 1
   const attempt = LlmAttemptId(`codebuddy-${input.turn}`)
-  let revision = 1
+  /** Dense position of the next chunk frame within this attempt. */
   let chunkIndex = 0
   const dispatch = agentEvents(input.ctx, input.agent)
   let started = false
@@ -193,14 +233,13 @@ export async function runCliTurn(input: {
     if (!started) return
     dispatch.emit('agent/assistant-stream', {
       frame: {
-        type: 'end', attemptId: attempt, revision, index: chunkIndex,
+        type: 'end', attemptId: attempt, revision: input.nextRevision(), index: chunkIndex,
         outcome: seq === undefined
           ? { kind: 'abandoned' }
           : { kind: 'committed', eventType: 'assistant/message', seq: SessionSeq(seq) },
       },
     })
     started = false
-    revision += 1
     chunkIndex = 0
   }
   // `for await` on a quiet CLI blocks until a line arrives or the process
@@ -229,17 +268,22 @@ export async function runCliTurn(input: {
       const events = withoutDuplicateResultText(projected.events, committed)
       for (const event of events) {
         if (event.kind === 'session') await input.onSession(event.cliSessionId)
-        else if (event.kind === 'live-text') {
+        else if (event.kind === 'live-chunk') {
           if (!started) {
+            // The Step opens before its first token, the way `agent-loop`
+            // brackets a model call. A transient chunk that arrived before its
+            // own `step/start` would be an update whose start is missing, which
+            // the conversation assembler rejects as an out-of-order Match.
+            stepStart(step)
             dispatch.emit('agent/assistant-stream', {
-              frame: { type: 'start', attemptId: attempt, revision, turn: input.turn, step },
+              frame: { type: 'start', attemptId: attempt, revision: input.nextRevision(), turn: input.turn, step },
             })
             started = true
           }
           dispatch.emit('agent/assistant-stream', {
             frame: {
-              type: 'chunk', attemptId: attempt, revision, index: chunkIndex, time: Date.now(),
-              chunk: { type: 'text-delta', index: 0, text: event.text },
+              type: 'chunk', attemptId: attempt, revision: input.nextRevision(), index: chunkIndex, time: Date.now(),
+              chunk: event.chunk,
             },
           })
           chunkIndex += 1
@@ -564,6 +608,15 @@ export class CodeBuddyAgent implements Agent {
   private idle = Promise.resolve()
   private active: AbortController | undefined
   private readonly dispatch: AgentEventDispatch
+  /**
+   * Revision of the last assistant-stream frame this Agent emitted.
+   *
+   * The Host folds frames into one dense stream per live Session and drops an
+   * attempt whose numbering skips, and the Web client refuses a gap as a lost
+   * carrier. Counters therefore live on the Agent, not on one turn: a turn that
+   * restarted at 1 would break every later turn's stream.
+   */
+  private assistantRevision = 0
   /** CLI session id remembered for the next `--resume`, when one exists. */
   binding: CliBinding | undefined
 
@@ -684,6 +737,31 @@ export class CodeBuddyAgent implements Agent {
     })
   }
 
+  /**
+   * Whether the running CLI ships `ViewImage`, cached after the first answer.
+   *
+   * Undefined until the catalog has been read, which happens on the first turn
+   * that carries an image.
+   */
+  private viewImageSupport: boolean | undefined = undefined
+
+  /**
+   * Resolve whether this CLI build has `ViewImage`.
+   * @returns the probe's answer, or true when discovery is unavailable so the
+   * common case keeps naming the tool.
+   */
+  private async supportsViewImage(): Promise<boolean> {
+    if (this.viewImageSupport !== undefined) return this.viewImageSupport
+    const catalog = await discoverModels(this.host, {
+      command: this.launch.command,
+      args: this.launch.args,
+      settingsPath: this.host.codebuddySettings.config.cliSettingsPath,
+      timeoutMs: this.host.codebuddySettings.config.modelsTimeoutMs,
+    }).catch(() => undefined)
+    this.viewImageSupport = catalog?.viewImage ?? true
+    return this.viewImageSupport
+  }
+
   private async pump(): Promise<void> {
     while (this.inbox.nextTurn.length > 0 || this.inbox.nextStep.length > 0) {
       const message = this.inbox.nextTurn[0] ?? this.inbox.nextStep[0]
@@ -696,6 +774,9 @@ export class CodeBuddyAgent implements Agent {
         text = promptContent(message, {
           cwd: this.session.header.cwd ?? process.cwd(),
           hostPath: ref => attachments?.imageHostPath(ref),
+          // A build without the tool must not be told to use it; the staged
+          // path alone is enough for `Read`.
+          viewImage: await this.supportsViewImage(),
         })
       } catch (error: unknown) {
         const messageText = error instanceof Error ? error.message : 'codebuddy turn failed'
@@ -730,6 +811,7 @@ export class CodeBuddyAgent implements Agent {
           graceMs: this.launch.graceMs,
           signal: controller.signal,
           dispatch: this.dispatch,
+          nextRevision: () => ++this.assistantRevision,
           onSession: async (id) => {
             this.binding = { cliSessionId: id, creator }
             await this.launch.remember(this.session.id, this.binding)

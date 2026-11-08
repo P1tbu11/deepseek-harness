@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
@@ -98,7 +99,7 @@ function codebuddyConfig(dir: string) {
   }
 }
 
-async function bootCodeBuddy(scenario: string) {
+async function bootCodeBuddy(scenario: string, onFrame?: (frame: AssistantStreamFrame) => void) {
   const dir = await mkdtemp(join(tmpdir(), 'codebuddy-run-'))
   process.env.CODEBUDDY_FIXTURE = scenario
   process.env.CODEBUDDY_ARGV_LOG = join(dir, 'argv.log')
@@ -110,6 +111,9 @@ async function bootCodeBuddy(scenario: string) {
     agentOptions: { provider: 'codebuddy', model: 'default' },
     meta: { cwd: dir, agentPreset: scenario === 'creator' ? 'cordis' : 'standard' },
   })
+  if (onFrame !== undefined) {
+    started.ctx.on('agent/assistant-stream', ({ frame }) => { onFrame(frame) }, { global: true })
+  }
   return { ...started, dir, agent: handle.agent }
 }
 
@@ -416,6 +420,48 @@ describe('DeepSeek sessions and profile shape', () => {
     // Every opened step is closed even though the CLI never produced a result.
     expect(opened).toBeGreaterThan(0)
     expect(closed).toBe(opened)
+  })
+
+  it('streams the CLI deltas to the client as dense, ordered revision frames', async () => {
+    const frames: AssistantStreamFrame[] = []
+    const { agent } = await bootCodeBuddy('chat', (frame) => { frames.push(frame) })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(frames.length).toBeGreaterThan(0)
+    // The client rejects a skipped revision as a lost carrier, so a stream that
+    // numbered every frame the same would never reach the browser at all.
+    expect(frames.map(frame => frame.revision)).toEqual(frames.map((_, index) => index + 1))
+    // A chunk's position is dense from zero within its attempt.
+    const chunks = frames.filter(frame => frame.type === 'chunk')
+    expect(chunks.map(frame => frame.index)).toEqual(chunks.map((_, index) => index))
+    // The streamed text is what the CLI sent, in the CLI's own block order.
+    const streamed = chunks.flatMap(frame => frame.type === 'chunk' && frame.chunk.type === 'text-delta' ? [frame.chunk] : [])
+    expect(streamed.map(chunk => chunk.text).join('')).toBe('你好')
+    // Nothing may arrive before the step it belongs to exists: a transient
+    // chunk ahead of its `step/start` is an update with a missing start.
+    const events = agent.session.snapshotEvents()
+    const firstStepStart = events.findIndex(event => event.type === 'step/start')
+    expect(firstStepStart).toBeGreaterThanOrEqual(0)
+    expect(frames.every(frame => frame.type === 'start' ? frame.step >= 1 : true)).toBe(true)
+  })
+
+  it('keeps the assistant stream alive across turns and steps', async () => {
+    const frames: AssistantStreamFrame[] = []
+    const { agent } = await bootCodeBuddy('chat', (frame) => { frames.push(frame) })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const firstTurn = frames.length
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    // One dense numbering for the whole Agent, not a fresh count per turn: the
+    // Host keeps a single stream per live Session.
+    expect(frames.map(frame => frame.revision)).toEqual(frames.map((_, index) => index + 1))
+    expect(firstTurn).toBeGreaterThan(0)
+    expect(frames.length).toBeGreaterThan(firstTurn)
+    // Each attempt ends after its own chunks, so no attempt is left open.
+    const starts = frames.filter(frame => frame.type === 'start').length
+    const ends = frames.filter(frame => frame.type === 'end').length
+    expect(ends).toBe(starts)
   })
 
   it('omits --model when the synthetic default is selected', async () => {

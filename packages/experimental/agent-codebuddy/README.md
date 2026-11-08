@@ -40,6 +40,15 @@ Add the package to the profile, then apply [`profile.patch.yml`](profile.patch.y
 
 `probe: true` with an empty `command` stats a fixed list plus an absolute `CODEBUDDY_BIN`. It does not search `PATH`, download a binary, or change CLI login. A new session uses this driver only when its provider is `codebuddy` at create or resume. Later model-picker changes do not switch engines.
 
+<a id="model-calls-without-a-session"></a>
+## Model calls without a session
+
+Two kinds of caller reach the `codebuddy` route. A DSH session is driven by the resident CLI process described above. Anything else arrives through `ctx.llm` with one assembled request and no session to continue — an auxiliary request from the agent loop, or a third-party plugin such as the media desk calling `prepareCall()` for its own prompts. Those take a one-shot `codebuddy -p` process instead, so the route answers every caller rather than only the ones that own a session.
+
+That path streams. `--output-format stream-json` emits NDJSON, and `--include-partial-messages` adds token-level `stream_event` frames, which `src/chat.ts` maps to the same `StreamChunk` vocabulary every other adapter emits. A build that answers with only whole `assistant` messages still works: the translator rebuilds blocks from that message when no delta arrived for it.
+
+A one-shot call carries no tools. `--tools ''` empties the built-in list where a build honors it, `--strict-mcp-config` keeps every MCP server out, and neither `--permission-mode` nor `-y` is passed, so the CLI's own gate refuses any tool the model attempts — the CLI documents headless tool use as requiring explicit pre-authorization. Every prompt is flattened to text turns for the same reason, and an image in the request becomes a placeholder rather than bytes, because no tool here could open a staged file. That projection is local to this path; the driver still sends images natively.
+
 To roll back, remove the bundle or set the `agent-loop` row back to `disabled: false` and remove `agent-codebuddy`. Restart if the profile has no HMR.
 
 Tests, from a built checkout:

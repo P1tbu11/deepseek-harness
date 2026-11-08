@@ -10,12 +10,19 @@ import { appendFileSync, writeFileSync } from 'node:fs'
 
 const scenario = process.env.CODEBUDDY_FIXTURE ?? 'chat'
 const help = process.argv.includes('--help')
-// A `--help` run is catalog discovery, not a session launch; the argv log holds
-// launches only, so tests can assert what the driver actually spawned.
-if (!help && process.env.CODEBUDDY_ARGV_LOG) {
+// The capability probe opens a session only to read its tool list; it is not a
+// turn. `CODEBUDDY_PROBE_TOKEN` is set by that probe so the argv log keeps
+// holding launches only.
+const probe = process.env.CODEBUDDY_PROBE_TOKEN === '1'
+// A `ctx.llm` caller takes the one-shot path: `-p`, no stream-json input, and a
+// prompt on stdin instead of an `initialize` control frame.
+const oneShot = process.argv.includes('-p') || process.argv.includes('--print')
+if (!help && !probe && process.env.CODEBUDDY_ARGV_LOG) {
   appendFileSync(process.env.CODEBUDDY_ARGV_LOG, `${JSON.stringify(process.argv)}\n`)
 }
-const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
+// The one-shot path reads raw stdin, so the line reader below is created only
+// for a driven session; two readers on one stream would split the input.
+const lines = oneShot ? undefined : createInterface({ input: process.stdin, crlfDelay: Infinity })
 const pending = []
 let resume = ''
 for (let index = 0; index < process.argv.length; index += 1) {
@@ -41,6 +48,76 @@ if (help) {
     '',
   ].join('\n'))
   process.exit(0)
+}
+
+// The one-shot path: the whole request arrives as plain text on stdin, and the
+// answer is a stream-json transcript that ends with one `result` frame. It does
+// not read `initialize`, because a `-p` call has no control channel.
+if (oneShot) {
+  let prompt = ''
+  for await (const chunk of process.stdin) prompt += chunk.toString()
+  const scenario = process.env.CODEBUDDY_ONESHOT ?? 'stream'
+  const args = process.argv
+  const flag = (name) => {
+    const at = args.indexOf(name)
+    return at < 0 ? undefined : args[at + 1]
+  }
+  if (scenario === 'stream') {
+    send({
+      type: 'system', subtype: 'init', session_id: 'oneshot-1',
+      tools: flag('--strict-mcp-config') === undefined ? ['Bash', 'Read'] : [],
+      model: flag('--model') ?? 'cli-native', permissionMode: 'default',
+    })
+    send({ type: 'stream_event', event: { type: 'message_start', message: { usage: { input_tokens: 0, output_tokens: 0 } } } })
+    send({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } })
+    send({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'plan' } } })
+    send({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
+    send({ type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } } })
+    for (const piece of ['answer', ' from ', 'prompt']) {
+      send({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: piece } } })
+    }
+    send({ type: 'stream_event', event: { type: 'content_block_stop', index: 1 } })
+    send({ type: 'stream_event', event: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 11, output_tokens: 3 } } })
+    send({ type: 'assistant', session_id: 'oneshot-1', message: { content: [{ type: 'text', text: 'answer from prompt' }], usage: { input_tokens: 11, output_tokens: 3 } } })
+    send({ type: 'system', subtype: 'usage_update', _meta: { 'codebuddy.ai/turnUsage': { total: { usage: { input_tokens: 11, output_tokens: 3, cache_read_input_tokens: 2 } } } } })
+    send({
+      type: 'result', subtype: 'success', is_error: false, result: 'answer from prompt',
+      uuid: 'oneshot-1', session_id: 'oneshot-1',
+      usage: { input_tokens: 11, output_tokens: 3, cache_read_input_tokens: 2 },
+    })
+    // A `-p` call keeps reading stdin until it closes; echoing the prompt proves
+    // the fixture saw the assembled text rather than an `initialize` frame.
+    if (prompt.includes('__fail__')) process.exit(9)
+    process.exit(0)
+  }
+  if (scenario === 'whole') {
+    // A build that does not stream deltas: one assistant message, then result.
+    send({
+      type: 'assistant', session_id: 'oneshot-1',
+      message: { content: [{ type: 'text', text: 'whole answer' }], usage: { input_tokens: 5, output_tokens: 2 } },
+    })
+    send({ type: 'result', subtype: 'success', is_error: false, result: 'whole answer', usage: { input_tokens: 5, output_tokens: 2 } })
+    process.exit(0)
+  }
+  if (scenario === 'error') {
+    send({ type: 'result', subtype: 'error', is_error: true, result: 'boom api_key=abc123' })
+    process.exit(0)
+  }
+  if (scenario === 'empty') {
+    send({ type: 'result', subtype: 'success', is_error: false, result: '' })
+    process.exit(0)
+  }
+  if (scenario === 'silent') {
+    process.stderr.write('crashed before result\n')
+    process.exit(4)
+  }
+  if (scenario === 'tool') {
+    send({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 't1', name: 'Bash', input: {} } } })
+    send({ type: 'result', subtype: 'success', is_error: false, result: 'x' })
+    process.exit(0)
+  }
+  process.stderr.write(`unknown one-shot scenario ${scenario}\n`)
+  process.exit(2)
 }
 
 async function nextLine() {
@@ -71,11 +148,21 @@ if (typeof prompt !== 'string') {
   process.exit(2)
 }
 
-send({ type: 'system', subtype: 'init', session_id: sessionId(), tools: ['Bash'], model: 'cli-native', permissionMode: 'default' })
+// The tool inventory a real build publishes here is what the capability probe
+// reads, so it lists the tools these scenarios actually use. A build without
+// ViewImage is exercised by the driver's own unit tests instead.
+send({ type: 'system', subtype: 'init', session_id: sessionId(), tools: ['Bash', 'Read', 'ViewImage'], model: 'cli-native', permissionMode: 'default' })
+
+// A probe stops after reading this line; answering the prompt would start a turn.
+if (probe) {
+  await new Promise(() => {})
+}
 
 if (scenario === 'chat') {
-  send({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '你' } } })
-  send({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '好' } } })
+  send({ type: 'stream_event', event: { index: 0, type: 'content_block_start', content_block: { type: 'text', text: '' } } })
+  send({ type: 'stream_event', event: { index: 0, type: 'content_block_delta', delta: { type: 'text_delta', text: '你' } } })
+  send({ type: 'stream_event', event: { index: 0, type: 'content_block_delta', delta: { type: 'text_delta', text: '好' } } })
+  send({ type: 'stream_event', event: { index: 0, type: 'content_block_stop' } })
   send({
     type: 'assistant',
     session_id: sessionId(),

@@ -110,6 +110,33 @@ describe('promptContent', () => {
     ])
   })
 
+  it('refuses an image whose object was pruned instead of linking a dead path', async () => {
+    const { cwd, object } = await workspace()
+    const message = messageWith([
+      { type: 'text', text: 'look' },
+      { type: 'image', attachment: imageRef() },
+    ])
+    // The store can be pruned after the message was recorded; a link to the
+    // missing object would still lint as a symlink and send the model hunting.
+    await rm(object, { force: true })
+    expect(() => promptContent(message, { cwd, hostPath: () => object }))
+      .toThrow(/UNSUPPORTED_INPUT.*attachment object is gone/)
+    expect(existsSync(join(cwd, IMAGE_STAGE_DIR, `${OBJECT_ID}.png`))).toBe(false)
+  })
+
+  it('names no tool when the CLI build lacks ViewImage', async () => {
+    const { cwd, object } = await workspace()
+    const message = messageWith([
+      { type: 'text', text: 'look' },
+      { type: 'image', attachment: imageRef() },
+    ])
+    const prompt = promptContent(message, { cwd, hostPath: () => object, viewImage: false })
+    // Naming a tool the build does not have would strand the model; the path
+    // alone is enough for it to reach for `Read`.
+    expect(prompt).toBe(`look\n[image file: ${IMAGE_STAGE_DIR}/${OBJECT_ID}.png — open it with Read]`)
+    expect(prompt).not.toContain('ViewImage')
+  })
+
   it('replaces a stale link from an earlier turn', async () => {
     const { cwd, object } = await workspace()
     const link = join(cwd, IMAGE_STAGE_DIR, `${OBJECT_ID}.png`)
