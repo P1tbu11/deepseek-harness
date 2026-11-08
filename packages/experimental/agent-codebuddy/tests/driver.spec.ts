@@ -362,6 +362,25 @@ describe('DeepSeek sessions and profile shape', () => {
     }
   })
 
+  it('publishes a context capacity for every advertised model so a mid-session switch can be priced', async () => {
+    const { ctx } = await bootCodeBuddy('chat')
+    const models = await ctx.llm.listModels('codebuddy')
+    expect(models.length).toBeGreaterThan(1)
+    for (const model of models) {
+      // Switching a live Session onto this route makes compaction price the
+      // existing history against the target's window. An adapter that reports
+      // no window is rejected with MODEL_SWITCH_COMPACTION_FAILED, which is why
+      // the same model worked in a new window but failed when selected mid-chat.
+      const info = await ctx.llm.resolveModelInfo('codebuddy', model.id)
+      expect(info.context?.contextWindow).toBeGreaterThan(0)
+      expect(Number.isInteger(info.context?.contextWindow)).toBe(true)
+      expect(info.defaultMaxTokens).toBeGreaterThan(0)
+      // The reserved completion must stay well inside the window it is drawn
+      // from, or the planner would have no input space at all.
+      expect(info.defaultMaxTokens!).toBeLessThan(info.context!.contextWindow)
+    }
+  })
+
   it('labels the synthetic default from the catalog rather than echoing the id', async () => {
     const { ctx } = await bootCodeBuddy('chat')
     const info = await ctx.llm.resolveModelInfo('codebuddy', 'default')
@@ -485,6 +504,38 @@ describe('DeepSeek sessions and profile shape', () => {
     expect(argv[0]).toContain('--model')
     expect(argv[0]).toContain('gemini-3.1-pro')
     expect(ctx).toBeDefined()
+  })
+
+  it('never forwards a model id owned by another provider', async () => {
+    const { agent, dir } = await bootCodeBuddy('chat')
+    // The native DeepSeek catalog calls the model `deepseek-flash`; this CLI
+    // calls the same model `deepseek-v4.1-flash`. Model ids are provider-scoped,
+    // so forwarding the foreign one asks the CLI for a model it has never heard
+    // of, and the gateway answers 400 with its entire model list.
+    agent.model.select({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    // No CLI process at all: the turn is refused before it starts.
+    await expect(readFile(join(dir, 'argv.log'), 'utf8')).rejects.toThrow()
+  })
+
+  it('explains a foreign model selection instead of failing inside the CLI', async () => {
+    const { agent } = await bootCodeBuddy('chat')
+    agent.model.select({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
+    expect(end?.type === 'turn/end' ? end.data.reason : {}).toMatchObject({
+      kind: 'error',
+      error: { code: 'UNSUPPORTED_MODEL' },
+    })
+    const reason = end?.type === 'turn/end' && end.data.reason.kind === 'error' ? end.data.reason.error.message : ''
+    // The message names both the refused route and the way out, and carries no
+    // gateway payload: no provider model list may leak into the transcript.
+    expect(reason).toContain('deepseek-account/deepseek-flash')
+    expect(reason).toContain('Select a CodeBuddy model')
+    expect(reason).not.toContain('Currently supported models')
+    expect(reason).not.toContain('claude-sonnet')
   })
 })
 

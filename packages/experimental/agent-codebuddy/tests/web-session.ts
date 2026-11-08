@@ -67,8 +67,14 @@ try {
   await ctx.agentDefaultModel.saveSelection({ provider: selected.selected.provider, model: selected.selected.model })
   assert.equal(ctx.agentDefaultModel.currentSelection().provider, 'codebuddy')
   await prompt(agent, 'still this session')
-  assert.match(reason(agent), /previous request model is preserved/)
-  await assert.rejects(readFile(argvLog, 'utf8'))
+  // A switch between providers must be priceable, so this turn runs rather than
+  // failing. Until the adapter published a context window it always died here
+  // with MODEL_SWITCH_COMPACTION_FAILED ("no context capacity for
+  // codebuddy/<model>") and the session was left unusable; a fresh session was
+  // the only way to reach the same model, which is why this used to assert the
+  // failure text.
+  assert.equal(reason(agent), 'completed')
+  assert.ok(texts(agent).length > 0)
 
   const again = await ctx.sessionController.create({ cwd: dir })
   assert.notEqual(again.sessionId, created.sessionId)
@@ -78,7 +84,14 @@ try {
   assert.ok(texts(next).includes('你好'))
   const argv = await readFile(argvLog, 'utf8')
   assert.match(argv, /--input-format=stream-json/)
-  assert.doesNotMatch(argv, /--system-prompt/)
+  // Only driven turns are checked here: the driver must never forward DSH's own
+  // system prompt to the CLI, which keeps its own persona. A `-p` one-shot call
+  // is a different route (session titles, auxiliary requests) that legitimately
+  // passes `--system-prompt`, and it only appears once a turn in this session
+  // has actually succeeded.
+  const driven = argv.trim().split('\n').filter(line => line.includes('--input-format=stream-json'))
+  assert.ok(driven.length > 0)
+  for (const line of driven) assert.doesNotMatch(line, /--system-prompt/)
 
   // The Web workspace picker passes a directory that is not the server's own
   // working directory; attaching must still succeed on the chosen path.

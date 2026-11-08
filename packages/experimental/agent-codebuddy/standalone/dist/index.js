@@ -1313,6 +1313,32 @@ function parseToolList(text) {
 //#endregion
 //#region lib/types/catalog.js
 /**
+* Context capacity advertised for every model this route serves.
+*
+* The CLI hides which backend model a given id resolves to, so the plugin
+* cannot read a per-model window from the CLI. It must still publish one:
+* the session-controller compares a conversation's size against the target
+* model's window before it switches models, and an adapter that reports no
+* capacity fails that switch outright rather than being treated as generous.
+*
+* 1,048,576 matches what the official DeepSeek listing declares for the models
+* the CLI is normally pointed at, and it is the conservative choice against a
+* larger unknown window: too small compacts earlier than necessary, while too
+* large lets a request overflow. A deployment whose CLI runs a smaller model
+* must lower this through settings.
+*/
+const CODEBUDDY_CONTEXT_WINDOW = 1048576;
+/**
+* Output tokens reserved out of {@link CODEBUDDY_CONTEXT_WINDOW} when the
+* compaction planner sizes a switch.
+*
+* The CLI owns its own completion budget, so this is not enforced by the
+* adapter; it only stops the planner from treating the whole window as free
+* input space. 8,192 is a typical coding-agent answer and leaves the rest of a
+* large window usable.
+*/
+const CODEBUDDY_DEFAULT_MAX_TOKENS = 8192;
+/**
 * Publish `codebuddy` on the existing provider catalog.
 *
 * Two callers share this route and they are not the same shape of call. A DSH
@@ -1379,12 +1405,24 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 	* Answering from the same catalog `listModels` advertises keeps selection and
 	* display consistent, and a request for an id the catalog does not offer fails
 	* here instead of inside the CLI.
+	*
+	* The context capacity is not decorative. Switching a live Session onto this
+	* route makes the compaction planner price the existing history against the
+	* target model, and it rejects a target that reports no window at all
+	* (`MODEL_SWITCH_COMPACTION_FAILED: no context capacity for
+	* codebuddy/<model>`). A session's first request never consults it, which is
+	* why the same model works in a new window but not when selected mid-session.
 	* @param provider - the route this adapter registered.
 	* @param model - exact model id a user selected.
-	* @returns resolved identity plus the modalities the catalog declared.
+	* @returns resolved identity, the modalities the catalog declared, and the
+	* capacity the compaction planner needs.
 	*/
 	async resolveModel(provider, model) {
 		const catalog = await this.catalog();
+		const capacity = {
+			context: { contextWindow: CODEBUDDY_CONTEXT_WINDOW },
+			defaultMaxTokens: CODEBUDDY_DEFAULT_MAX_TOKENS
+		};
 		if (model === "default") {
 			const configured = catalog.configured;
 			return {
@@ -1392,7 +1430,8 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 				id: model,
 				name: "Default",
 				description: configured === "" ? "Uses the model configured in the CodeBuddy CLI" : `Uses the CodeBuddy CLI's configured model: ${configured}`,
-				inputModalities: ["text", "image"]
+				inputModalities: ["text", "image"],
+				...capacity
 			};
 		}
 		if (!catalog.models.includes(model)) throw new LlmError(`CodeBuddy does not advertise model "${model}"`, "UNKNOWN_MODEL");
@@ -1400,7 +1439,8 @@ var CodeBuddyCatalog = class extends LlmAdapter {
 			provider,
 			id: model,
 			name: model,
-			inputModalities: ["text", "image"]
+			inputModalities: ["text", "image"],
+			...capacity
 		};
 	}
 	async listModels(provider) {
@@ -2160,13 +2200,40 @@ var CodeBuddyAgent = class {
 	* An empty string means "send no flag", which is how the CLI's own configured
 	* model takes effect. {@link DEFAULT_MODEL_ID} is a synthetic selection that
 	* maps to that empty string; it is never passed as an argument.
+	*
+	* Only a selection owned by this provider may become a `--model` value.
+	* Model ids are provider-scoped, and the same underlying model can carry a
+	* different id on another route — the native DeepSeek catalog calls one
+	* `deepseek-flash` while this CLI calls it `deepseek-v4.1-flash`. Forwarding
+	* a foreign id asks the CLI for a model it has never heard of, and the
+	* gateway answers 400 with its whole model list, which the turn then renders
+	* as a wall of text. A foreign selection therefore falls through to the
+	* CLI's own configured model, the one route this driver can always honour.
 	* @returns the model id to pass, or an empty string to omit the flag.
 	*/
 	cliModel() {
-		const chosen = this.model.current()?.model ?? "";
+		const selected = this.model.current();
+		const chosen = selected?.provider === "codebuddy" ? selected.model : "";
 		if (chosen !== "" && chosen !== "default") return chosen;
 		if (this.launch.model !== void 0 && this.launch.model !== "" && this.launch.model !== "default") return this.launch.model;
 		return "";
+	}
+	/**
+	* The recorded selection when it belongs to another provider, or undefined.
+	*
+	* Model ids are provider-scoped, so a selection from another route names a
+	* model this driver cannot run. Reported before a turn starts rather than
+	* forwarded to the CLI as an unknown id.
+	* @returns the foreign selection, or undefined when the session's own
+	* provider is selected (or nothing is recorded yet).
+	*/
+	foreignSelection() {
+		const selected = this.model.current();
+		if (selected === void 0 || selected.provider === "codebuddy") return void 0;
+		return {
+			provider: selected.provider,
+			model: selected.model
+		};
 	}
 	wake() {
 		if (this.phase === "running") return;
@@ -2228,6 +2295,22 @@ var CodeBuddyAgent = class {
 						error: {
 							message: messageText,
 							code: "UNSUPPORTED_INPUT"
+						}
+					}
+				});
+				this.turn += 1;
+				continue;
+			}
+			const foreign = this.foreignSelection();
+			if (foreign !== void 0) {
+				this.session.append("turn/start", { turn: this.turn + 1 });
+				this.session.append("turn/end", {
+					turn: this.turn + 1,
+					reason: {
+						kind: "error",
+						error: {
+							message: `This session runs the CodeBuddy CLI, whose model ids are its own: ${foreign.provider}/${foreign.model} cannot be passed to it. Select a CodeBuddy model, or start a new session on that provider.`,
+							code: "UNSUPPORTED_MODEL"
 						}
 					}
 				});

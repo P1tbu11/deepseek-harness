@@ -705,22 +705,46 @@ export class CodeBuddyAgent implements Agent {
   }
 
   /**
- * The `--model` value for the next CLI process.
- *
- * An empty string means "send no flag", which is how the CLI's own configured
- * model takes effect. {@link DEFAULT_MODEL_ID} is a synthetic selection that
- * maps to that empty string; it is never passed as an argument.
- * @returns the model id to pass, or an empty string to omit the flag.
- */
+   * The `--model` value for the next CLI process.
+   *
+   * An empty string means "send no flag", which is how the CLI's own configured
+   * model takes effect. {@link DEFAULT_MODEL_ID} is a synthetic selection that
+   * maps to that empty string; it is never passed as an argument.
+   *
+   * Only a selection owned by this provider may become a `--model` value.
+   * Model ids are provider-scoped, and the same underlying model can carry a
+   * different id on another route — the native DeepSeek catalog calls one
+   * `deepseek-flash` while this CLI calls it `deepseek-v4.1-flash`. Forwarding
+   * a foreign id asks the CLI for a model it has never heard of, and the
+   * gateway answers 400 with its whole model list, which the turn then renders
+   * as a wall of text. A foreign selection therefore falls through to the
+   * CLI's own configured model, the one route this driver can always honour.
+   * @returns the model id to pass, or an empty string to omit the flag.
+   */
   private cliModel(): string {
     const selected = this.model.current()
-    const chosen = selected?.model ?? ''
+    const chosen = selected?.provider === CODEBUDDY_PROVIDER ? selected.model : ''
     if (chosen !== '' && chosen !== DEFAULT_MODEL_ID) return chosen
     // A settings-level model still pins every session, including `default`.
     if (this.launch.model !== undefined && this.launch.model !== '' && this.launch.model !== DEFAULT_MODEL_ID) {
       return this.launch.model
     }
     return ''
+  }
+
+  /**
+   * The recorded selection when it belongs to another provider, or undefined.
+   *
+   * Model ids are provider-scoped, so a selection from another route names a
+   * model this driver cannot run. Reported before a turn starts rather than
+   * forwarded to the CLI as an unknown id.
+   * @returns the foreign selection, or undefined when the session's own
+   * provider is selected (or nothing is recorded yet).
+   */
+  private foreignSelection(): { provider: string; model: string } | undefined {
+    const selected = this.model.current()
+    if (selected === undefined || selected.provider === CODEBUDDY_PROVIDER) return undefined
+    return { provider: selected.provider, model: selected.model }
   }
 
   private wake(): void {
@@ -784,6 +808,28 @@ export class CodeBuddyAgent implements Agent {
         this.session.append('turn/end', {
           turn: this.turn + 1,
           reason: { kind: 'error', error: { message: messageText, code: 'UNSUPPORTED_INPUT' } },
+        })
+        this.turn += 1
+        continue
+      }
+      const foreign = this.foreignSelection()
+      if (foreign !== undefined) {
+        // The session is a CodeBuddy session for life: selecting a model from
+        // another provider records a choice this driver cannot run, and no
+        // retry can change that. Say so once, with the two ways out, instead of
+        // sending an id the CLI does not know.
+        this.session.append('turn/start', { turn: this.turn + 1 })
+        this.session.append('turn/end', {
+          turn: this.turn + 1,
+          reason: {
+            kind: 'error',
+            error: {
+              message: 'This session runs the CodeBuddy CLI, whose model ids are its own: '
+                + `${foreign.provider}/${foreign.model} cannot be passed to it. `
+                + 'Select a CodeBuddy model, or start a new session on that provider.',
+              code: 'UNSUPPORTED_MODEL',
+            },
+          },
         })
         this.turn += 1
         continue

@@ -7,6 +7,34 @@ import type CodeBuddySettingsService from './settings.ts'
 import { discoverModels, type ModelCatalog } from './models.ts'
 
 /**
+ * Context capacity advertised for every model this route serves.
+ *
+ * The CLI hides which backend model a given id resolves to, so the plugin
+ * cannot read a per-model window from the CLI. It must still publish one:
+ * the session-controller compares a conversation's size against the target
+ * model's window before it switches models, and an adapter that reports no
+ * capacity fails that switch outright rather than being treated as generous.
+ *
+ * 1,048,576 matches what the official DeepSeek listing declares for the models
+ * the CLI is normally pointed at, and it is the conservative choice against a
+ * larger unknown window: too small compacts earlier than necessary, while too
+ * large lets a request overflow. A deployment whose CLI runs a smaller model
+ * must lower this through settings.
+ */
+const CODEBUDDY_CONTEXT_WINDOW = 1_048_576
+
+/**
+ * Output tokens reserved out of {@link CODEBUDDY_CONTEXT_WINDOW} when the
+ * compaction planner sizes a switch.
+ *
+ * The CLI owns its own completion budget, so this is not enforced by the
+ * adapter; it only stops the planner from treating the whole window as free
+ * input space. 8,192 is a typical coding-agent answer and leaves the rest of a
+ * large window usable.
+ */
+const CODEBUDDY_DEFAULT_MAX_TOKENS = 8_192
+
+/**
  * Publish `codebuddy` on the existing provider catalog.
  *
  * Two callers share this route and they are not the same shape of call. A DSH
@@ -72,9 +100,17 @@ class CodeBuddyCatalog extends LlmAdapter {
    * Answering from the same catalog `listModels` advertises keeps selection and
    * display consistent, and a request for an id the catalog does not offer fails
    * here instead of inside the CLI.
+   *
+   * The context capacity is not decorative. Switching a live Session onto this
+   * route makes the compaction planner price the existing history against the
+   * target model, and it rejects a target that reports no window at all
+   * (`MODEL_SWITCH_COMPACTION_FAILED: no context capacity for
+   * codebuddy/<model>`). A session's first request never consults it, which is
+   * why the same model works in a new window but not when selected mid-session.
    * @param provider - the route this adapter registered.
    * @param model - exact model id a user selected.
-   * @returns resolved identity plus the modalities the catalog declared.
+   * @returns resolved identity, the modalities the catalog declared, and the
+   * capacity the compaction planner needs.
    */
   override async resolveModel(provider: string, model: string): Promise<{
     provider: string
@@ -82,8 +118,14 @@ class CodeBuddyCatalog extends LlmAdapter {
     name: string
     description?: string
     inputModalities?: readonly ['text', ...'image'[]]
+    context: { contextWindow: number }
+    defaultMaxTokens: number
   }> {
     const catalog = await this.catalog()
+    const capacity = {
+      context: { contextWindow: CODEBUDDY_CONTEXT_WINDOW },
+      defaultMaxTokens: CODEBUDDY_DEFAULT_MAX_TOKENS,
+    }
     if (model === DEFAULT_MODEL_ID) {
       const configured = catalog.configured
       return {
@@ -94,6 +136,7 @@ class CodeBuddyCatalog extends LlmAdapter {
           ? 'Uses the model configured in the CodeBuddy CLI'
           : `Uses the CodeBuddy CLI's configured model: ${configured}`,
         inputModalities: ['text', 'image'],
+        ...capacity,
       }
     }
     if (!catalog.models.includes(model)) {
@@ -102,7 +145,7 @@ class CodeBuddyCatalog extends LlmAdapter {
         'UNKNOWN_MODEL',
       )
     }
-    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
+    return { provider, id: model, name: model, inputModalities: ['text', 'image'], ...capacity }
   }
 
   override async listModels(provider: string): Promise<readonly {
