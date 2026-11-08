@@ -1,0 +1,7 @@
+# Bilingual-pair consistency record for codebuddy.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/subsystems/codebuddy.md
+/codebuddy-cli:
+  en: e1323fc1ad236433
+  zh: 39bf2c9d8c245e8d

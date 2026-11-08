@@ -37,6 +37,21 @@ const PEER_SECTIONS = ['peerDependencies'] as const
 /** The workspace root manifest, which is never a release member. */
 const WORKSPACE_ROOT_PACKAGE = '@deepseek-ai/dsh-root'
 
+/**
+ * Accept one version per member, rejecting any this repository cannot publish.
+ *
+ * Families whose members version independently — vendored libraries and
+ * redistributable bundles — share this rule rather than one shared version.
+ * @param members - the family's members.
+ */
+function verifyIndependentlyVersioned(members: readonly ReleaseMember[]): void {
+  for (const member of members) {
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(member.version)) {
+      throw new Error(`${member.directory} has an unpublishable version: ${member.version}`)
+    }
+  }
+}
+
 /** One peer declaration the publish order leaves unordered. */
 interface DroppedPeerEdge {
   readonly consumer: string
@@ -109,6 +124,15 @@ export abstract class ReleaseFamily {
   abstract readonly tagPrefix: string
 
   /**
+   * npm scope every member name must carry, or `undefined` to accept any.
+   *
+   * The `dsh` family lives under the project's own scope. A family that
+   * publishes a redistributable bundle under someone else's scope states it
+   * here, so the check still rejects a stray unscoped name.
+   */
+  readonly scope: string | undefined = '@deepseek-ai/'
+
+  /**
    * Assert that built artifacts match this release family's required profile.
    * Families without environment-selected artifacts accept every build tree.
    * @param _root - repository root containing generated artifacts.
@@ -133,7 +157,9 @@ export abstract class ReleaseFamily {
       const name = requireString(manifest, 'name', normalized)
       const version = requireString(manifest, 'version', normalized)
       if (name === WORKSPACE_ROOT_PACKAGE) throw new Error(`${normalized} selected the workspace root`)
-      if (!name.startsWith('@deepseek-ai/')) throw new Error(`${normalized} must name an @deepseek-ai package`)
+      if (this.scope !== undefined && !name.startsWith(this.scope)) {
+        throw new Error(`${normalized} must name an ${this.scope} package`)
+      }
       if (seen.has(name)) throw new Error(`${name} appears twice in release family ${this.id}`)
       seen.add(name)
       members.push({
@@ -429,11 +455,7 @@ class VendorFamily extends ReleaseFamily {
    * @param members - this family's members.
    */
   verifyVersions(members: readonly ReleaseMember[]): void {
-    for (const member of members) {
-      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(member.version)) {
-        throw new Error(`${member.directory} has an unpublishable version: ${member.version}`)
-      }
-    }
+    verifyIndependentlyVersioned(members)
   }
 
   /**
@@ -465,9 +487,57 @@ class VendorFamily extends ReleaseFamily {
   readonly installedEntry = undefined
 }
 
+/**
+ * Redistributable bundles that install into someone else's Harness profile.
+ *
+ * These sit below the product scope because they are not part of the official
+ * release: a bundle a third party publishes under their own npm scope cannot
+ * carry `@deepseek-ai/`, and that name would be ours to defend rather than
+ * theirs to publish. The family exists so the ordinary pack/verify/publish
+ * sequence still owns them, with their own version baseline and tags.
+ */
+class BundleFamily extends ReleaseFamily {
+  readonly id = 'bundle'
+  /** Standalone bundles live one level below their workspace package. */
+  readonly patterns = ['packages/*/*/standalone/package.json'] as const
+  readonly tagPrefix = 'bundle-'
+  /** No scope rule: each bundle publishes under whoever maintains it. */
+  override readonly scope = undefined
+
+  /**
+   * Accept independent versions; only reject a version this repository cannot publish.
+   * @param members - this family's members.
+   */
+  verifyVersions(members: readonly ReleaseMember[]): void {
+    verifyIndependentlyVersioned(members)
+  }
+
+  /**
+   * One tag per member, because the bundles version independently.
+   * @param member - the member being published.
+   * @returns `bundle-<unscoped name>-v`.
+   */
+  tagPrefixFor(member: ReleaseMember): string {
+    return `${this.tagPrefix}${member.name.replace(/^@[^/]+\//, '')}-v`
+  }
+
+  /**
+   * The bundle ships tracked build output rather than a `src` tree, so the
+   * harness policy applies unchanged: no source and no maps.
+   * @param member - the packed member.
+   * @param files - every path inside its tarball.
+   */
+  validatePayload(member: ReleaseMember, files: readonly string[]): void {
+    validateTarballPayload(files, `${member.name}@${member.version}`)
+  }
+
+  /** No executable to install and run. */
+  readonly installedEntry = undefined
+}
+
 /** Every release family this module owns, in workflow order. */
 function releaseFamilies(): readonly ReleaseFamily[] {
-  return [new DshFamily(), new VendorFamily()]
+  return [new DshFamily(), new VendorFamily(), new BundleFamily()]
 }
 
 /**

@@ -1,0 +1,64 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write packages/experimental/agent-codebuddy/README.md
+/:
+  en: b03a96749ce853d3
+  zh: e9a874ed4365fff8
+/deepseek-ai-dsh-agent-codebuddy:
+  en: bf617a8049e7ae89
+  zh: 51174c0f0a1831e6
+/deepseek-ai-dsh-agent-codebuddy/summary:
+  en: e3b74e63a1f4736e
+  zh: 2ed642abc8bbac71
+/deepseek-ai-dsh-agent-codebuddy/table-of-contents:
+  en: 547abd863505d2f2
+  zh: 917b51808945de4f
+/deepseek-ai-dsh-agent-codebuddy/use-this-package:
+  en: 1316cb0d6f7bf8a3
+  zh: efda020c81a4ccd8
+/deepseek-ai-dsh-agent-codebuddy/output-fidelity:
+  en: b873baab46c3b7d9
+  zh: 8c6978a9469a98b4
+/deepseek-ai-dsh-agent-codebuddy/understand-the-implementation:
+  en: 8f3aa11f81285cad
+  zh: 3dfc9626ae4e1007
+/deepseek-ai-dsh-agent-codebuddy/further-exploration:
+  en: fe5cc7286cfa3eeb
+  zh: 560352ea769c894c
+/deepseek-ai-dsh-agent-codebuddy/protocol-basis:
+  en: 6119eacf0d804918
+  zh: 0b0caf26ad7be6e0
+/deepseek-ai-dsh-agent-codebuddy/model-experience:
+  en: 215e7ba838619b7b
+  zh: a311da3843709f90
+/deepseek-ai-dsh-agent-codebuddy/model-experience/child-request:
+  en: 1796fa78833bfc2b
+  zh: b78af12284632249
+/deepseek-ai-dsh-agent-codebuddy/model-experience/child-request/what-the-model-sees:
+  en: 6ebc3d26c6d6cbd3
+  zh: 37f8203e88bf2ef4
+/deepseek-ai-dsh-agent-codebuddy/model-experience/child-request/token-effect:
+  en: f67d37ccceb657d3
+  zh: 0b201d74ad85378c
+/deepseek-ai-dsh-agent-codebuddy/model-experience/child-request/kv-cache-effect:
+  en: bf911fa8d8154663
+  zh: c9e8d71c81e4c1bf
+/deepseek-ai-dsh-agent-codebuddy/model-experience/parent-scheduling-and-results-indirectly:
+  en: 4c391bb16e3cd380
+  zh: c5236b3f655bc9a4
+/deepseek-ai-dsh-agent-codebuddy/model-experience/parent-scheduling-and-results-indirectly/what-the-model-sees:
+  en: f2a6cbcf0885deab
+  zh: f90daba6677af414
+/deepseek-ai-dsh-agent-codebuddy/model-experience/parent-scheduling-and-results-indirectly/token-effect:
+  en: 287be73609a4a9ba
+  zh: b7c822ec697b06e9
+/deepseek-ai-dsh-agent-codebuddy/model-experience/parent-scheduling-and-results-indirectly/kv-cache-effect:
+  en: f27e4a46713af5dc
+  zh: 8e7da817f7a4954c
+/deepseek-ai-dsh-agent-codebuddy/known-limitations-and-deferred-work:
+  en: b2fe6b06c77ab558
+  zh: f31402ca833cd4b9
+/deepseek-ai-dsh-agent-codebuddy/known-limitations-and-deferred-work/dev-note:
+  en: 5def6a5870cdce3f
+  zh: d3a060befa19fbbb

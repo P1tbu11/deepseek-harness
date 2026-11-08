@@ -50,6 +50,7 @@ describe('release families', () => {
       .filter(member => member.directory.startsWith('packages/experimental/'))
       .map(member => member.name)).toEqual([
       '@deepseek-ai/dsh-action-cards',
+      '@deepseek-ai/dsh-agent-codebuddy',
       '@deepseek-ai/dsh-experimental-api-speech-to-text',
       '@deepseek-ai/dsh-experimental-auto-review',
       '@deepseek-ai/dsh-experimental-badge-skill-bundle',

@@ -37,6 +37,7 @@
       "@deepseek-ai/dsh-client-ui-entry-customization/client": ["./packages/client/ui-entry-customization/src/client/index.ts"],
       "@deepseek-ai/dsh-client-ui-entry-customization/src/*": ["./packages/client/ui-entry-customization/src/*"],
       "@deepseek-ai/dsh-experimental-session-search": ["./packages/experimental/session-search/src/index.ts"],
+      "@deepseek-ai/dsh-agent-codebuddy": ["./packages/experimental/agent-codebuddy/src/index.ts"],
       "@deepseek-ai/dsh-experimental-subagent-oar": ["./packages/experimental/subagent-oar/src/index.ts"],
       "@deepseek-ai/dsh-experimental-tool-subagent-oar": ["./packages/experimental/tool-subagent-oar/src/index.ts"],
       "@deepseek-ai/dsh-experimental-ralph-bundle": ["./packages/experimental/ralph-bundle/src/index.ts"],

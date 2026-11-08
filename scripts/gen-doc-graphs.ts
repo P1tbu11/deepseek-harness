@@ -108,6 +108,13 @@ const GROUP_ORDER = [
 
 const SERVICE_ROLES: ServiceRole[] = [
   {
+    key: 'codebuddySettings',
+    pkg: 'agent-codebuddy',
+    title: 'CodeBuddy CLI settings',
+    mode: 'service',
+    note: 'Holds the executable path, probe switch, optional model, and session-map directory read by the CodeBuddy factory. Other providers do not read it.',
+  },
+  {
     key: 'actionCards',
     pkg: 'action-cards',
     title: 'Optional action cards',
