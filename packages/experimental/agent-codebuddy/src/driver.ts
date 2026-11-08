@@ -423,21 +423,21 @@ export async function runNativeTurn(input: {
   session.append('user/message', input.message, { surfaceOp: 'append' })
   const attempt = LlmAttemptId(`native-${turn}`)
   let started = false
-  let chunkIndex = 0
   session.append('step/start', { turn, step })
 
-  const finishLive = (seq: number | undefined): void => {
+  const finishLive = (live: NativeStream, seq: number | undefined): void => {
     if (!started) return
     input.dispatch.emit('agent/assistant-stream', {
+      // The end frame reports how many chunks preceded it, so the reader can
+      // verify it received them all.
       frame: {
-        type: 'end', attemptId: attempt, revision: input.nextRevision(), index: chunkIndex,
+        type: 'end', attemptId: attempt, revision: input.nextRevision(), index: live.emitted,
         outcome: seq === undefined
           ? { kind: 'abandoned' }
           : { kind: 'committed', eventType: 'assistant/message', seq: SessionSeq(seq) },
       },
     })
     started = false
-    chunkIndex = 0
   }
 
   try {
@@ -480,7 +480,7 @@ export async function runNativeTurn(input: {
         signal,
       }))
 
-      const live = new NativeStream(input, attempt)
+      const live = new NativeStream(input, attempt, turn, step)
       let failure: unknown
       try {
         const stream = prepared.stream(request)
@@ -511,17 +511,17 @@ export async function runNativeTurn(input: {
             ...live.usage === undefined ? {} : { usage: live.usage },
             stream: live.stream,
           }, { surfaceOp: 'append' })
-          finishLive(undefined)
+          finishLive(live, undefined)
         } else {
           session.append('assistant/attempt', { turn, step, stream: live.stream })
-          finishLive(undefined)
+          finishLive(live, undefined)
         }
         throw error
       }
 
       if (failure !== undefined) {
         session.append('assistant/attempt', { turn, step, stream: live.stream })
-        finishLive(undefined)
+        finishLive(live, undefined)
         throw failure
       }
 
@@ -540,7 +540,7 @@ export async function runNativeTurn(input: {
         stream: live.stream,
         ...live.usage === undefined ? {} : { usage: live.usage },
       }, { surfaceOp: 'append' }).seq
-      finishLive(seq)
+      finishLive(live, seq)
 
       const calls = blocks.filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
       if (calls.length > 0) {
@@ -610,16 +610,36 @@ class NativeStream {
   failure: string | undefined
   opened = false
 
+  /** Number of chunk frames this attempt has published, reported by its end frame. */
+  get emitted(): number {
+    return this.index
+  }
+
   constructor(
     private readonly input: {
       readonly dispatch: AgentEventDispatch
       readonly nextRevision: () => number
     },
     private readonly attempt: LlmAttemptId,
+    private readonly turn: number,
+    private readonly step: number,
   ) {}
 
   start(): void {
     this.opened = true
+    // The opening frame is not optional. The Host keeps one dense stream per
+    // live Session and only begins an attempt when it receives `start`; a
+    // `chunk` that arrives without one is discarded outright, and the client
+    // ignores chunks for an attempt it never saw start. Emitting only chunks
+    // therefore produced no live text at all — every native turn rendered as one
+    // block at settlement, while the CLI path streamed normally because it
+    // already sent this frame.
+    this.input.dispatch.emit('agent/assistant-stream', {
+      frame: {
+        type: 'start', attemptId: this.attempt, revision: this.input.nextRevision(),
+        turn: this.turn, step: this.step,
+      },
+    })
   }
 
   /** Record one chunk, publish it as a live frame, and fold it into the attempt. */

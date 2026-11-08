@@ -612,6 +612,39 @@ describe('DeepSeek sessions and profile shape', () => {
       expect(inMessages.has(result.data.message.source.callId)).toBe(true)
     }
   })
+  it('streams a native turn live after switching away from the CLI', async () => {
+    // The Session must START on codebuddy: only then does it get a CodeBuddyAgent,
+    // and only then does `runNativeTurn` handle the switched-to turn. A Session
+    // created directly on the native provider goes through the stock agent loop
+    // instead, which would make this test pass without exercising the code.
+    const frames: AssistantStreamFrame[] = []
+    const { agent } = await bootCodeBuddy('chat', (frame) => { frames.push(frame) })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first on cli' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    frames.length = 0
+    agent.model.select({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'now native' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(frames.length).toBeGreaterThan(0)
+    // A native turn is identified by its attempt id, which the CLI path never uses.
+    const native = frames.filter(frame => frame.attemptId.startsWith('native-'))
+    expect(native.length).toBeGreaterThan(0)
+    // The opening frame is what lets the Host begin an attempt; without it every
+    // chunk is discarded and the reply appears at once when it settles.
+    expect(native[0]?.type).toBe('start')
+    const chunks = native.filter(frame => frame.type === 'chunk')
+    expect(chunks.length).toBeGreaterThan(1)
+    // Revisions are dense across the whole Agent, not restarted per turn: the
+    // Host keeps one stream per Session, so a reset would break every later turn.
+    expect(native.map(frame => frame.revision))
+      .toEqual(native.map((_, index) => (native[0]?.revision ?? 0) + index))
+    // Chunk positions dense from zero, and the end frame counts them all.
+    expect(chunks.map(frame => frame.index)).toEqual(chunks.map((_, index) => index))
+    const end = native.at(-1)
+    expect(end?.type).toBe('end')
+    expect(end?.type === 'end' ? end.index : -1).toBe(chunks.length)
+  })
 })
 
 function turnEnds(agent: Agent): string[] {

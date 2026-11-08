@@ -2027,18 +2027,17 @@ async function runNativeTurn(input) {
 	session.append("user/message", input.message, { surfaceOp: "append" });
 	const attempt = LlmAttemptId(`native-${turn}`);
 	let started = false;
-	let chunkIndex = 0;
 	session.append("step/start", {
 		turn,
 		step
 	});
-	const finishLive = (seq) => {
+	const finishLive = (live, seq) => {
 		if (!started) return;
 		input.dispatch.emit("agent/assistant-stream", { frame: {
 			type: "end",
 			attemptId: attempt,
 			revision: input.nextRevision(),
-			index: chunkIndex,
+			index: live.emitted,
 			outcome: seq === void 0 ? { kind: "abandoned" } : {
 				kind: "committed",
 				eventType: "assistant/message",
@@ -2046,7 +2045,6 @@ async function runNativeTurn(input) {
 			}
 		} });
 		started = false;
-		chunkIndex = 0;
 	};
 	try {
 		const tools = input.ctx.tools;
@@ -2092,7 +2090,7 @@ async function runNativeTurn(input) {
 				sessionId: session.id,
 				signal
 			}));
-			const live = new NativeStream(input, attempt);
+			const live = new NativeStream(input, attempt, turn, step);
 			let failure;
 			try {
 				const stream = prepared.stream(request);
@@ -2122,14 +2120,14 @@ async function runNativeTurn(input) {
 						...live.usage === void 0 ? {} : { usage: live.usage },
 						stream: live.stream
 					}, { surfaceOp: "append" });
-					finishLive(void 0);
+					finishLive(live, void 0);
 				} else {
 					session.append("assistant/attempt", {
 						turn,
 						step,
 						stream: live.stream
 					});
-					finishLive(void 0);
+					finishLive(live, void 0);
 				}
 				throw error;
 			}
@@ -2139,7 +2137,7 @@ async function runNativeTurn(input) {
 					step,
 					stream: live.stream
 				});
-				finishLive(void 0);
+				finishLive(live, void 0);
 				throw failure;
 			}
 			const blocks = live.blocks();
@@ -2157,7 +2155,7 @@ async function runNativeTurn(input) {
 				stream: live.stream,
 				...live.usage === void 0 ? {} : { usage: live.usage }
 			}, { surfaceOp: "append" }).seq;
-			finishLive(seq);
+			finishLive(live, seq);
 			const calls = blocks.filter((block) => block.type === "tool-call");
 			if (calls.length > 0) {
 				const batch = await tools.execute({
@@ -2233,6 +2231,8 @@ async function runNativeTurn(input) {
 var NativeStream = class {
 	input;
 	attempt;
+	turn;
+	step;
 	accumulator = new AssistantStreamAccumulator();
 	assembler = new BlockAssembler();
 	index = 0;
@@ -2241,12 +2241,25 @@ var NativeStream = class {
 	finish = { kind: "stop" };
 	failure;
 	opened = false;
-	constructor(input, attempt) {
+	/** Number of chunk frames this attempt has published, reported by its end frame. */
+	get emitted() {
+		return this.index;
+	}
+	constructor(input, attempt, turn, step) {
 		this.input = input;
 		this.attempt = attempt;
+		this.turn = turn;
+		this.step = step;
 	}
 	start() {
 		this.opened = true;
+		this.input.dispatch.emit("agent/assistant-stream", { frame: {
+			type: "start",
+			attemptId: this.attempt,
+			revision: this.input.nextRevision(),
+			turn: this.turn,
+			step: this.step
+		} });
 	}
 	/** Record one chunk, publish it as a live frame, and fold it into the attempt. */
 	push(chunk) {
